@@ -12,7 +12,7 @@ from .policies import PolicyResult, simulate_ceiling, simulate_policy
 from .trace import TraceData
 
 DEFAULT_BUDGETS_GIB = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-DEFAULT_POLICIES = ["fifo", "lru", "optimal"]
+DEFAULT_POLICIES = ["fifo", "lru", "lru-flat", "optimal"]
 THROUGHPUT_EPSILON = 0.001
 THROUGHPUT_DISPLAY_CAP = 1000.0
 

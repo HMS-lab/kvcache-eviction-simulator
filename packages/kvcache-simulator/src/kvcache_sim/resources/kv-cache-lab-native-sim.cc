@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <list>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -105,7 +106,7 @@ Options parse_args(int argc, char** argv) {
     else throw std::runtime_error("Unknown argument: " + arg);
   }
   if (options.policy.empty() || options.ids_path.empty() || options.tokens_path.empty() || options.total_blocks == 0) {
-    throw std::runtime_error("Usage: kv-cache-lab-native-sim --policy fifo|lru|optimal|all|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--next PATH]");
+    throw std::runtime_error("Usage: kv-cache-lab-native-sim --policy fifo|lru|lru-flat|optimal|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--next PATH]");
   }
   if (options.policy != "build-next" && (options.request_ends_path.empty() || options.request_count == 0)) {
     throw std::runtime_error("--request-ends and --request-count are required");
@@ -383,6 +384,82 @@ Result simulate_fifo(const SimulationInput& input, std::uint32_t capacity, const
   return result;
 }
 
+// Node IDs retain prefix identity; eviction ignores parent/child relationships.
+class FlatLruCache {
+ public:
+  explicit FlatLruCache(std::uint32_t capacity) : capacity_(capacity) {}
+
+  bool contains(std::uint32_t node) const { return entries_.find(node) != entries_.end(); }
+  std::size_t size() const { return entries_.size(); }
+
+  void touch(std::uint32_t node) {
+    order_.splice(order_.begin(), order_, entries_.at(node));
+  }
+
+  void write(std::uint32_t node) {
+    if (capacity_ == 0) return;
+    if (contains(node)) {
+      touch(node);
+      return;
+    }
+    if (size() >= capacity_) {
+      entries_.erase(order_.back());
+      order_.pop_back();
+    }
+    order_.push_front(node);
+    entries_.emplace(node, order_.begin());
+  }
+
+ private:
+  std::uint32_t capacity_;
+  std::list<std::uint32_t> order_;  // Most recently used first.
+  std::unordered_map<std::uint32_t, std::list<std::uint32_t>::iterator> entries_;
+};
+
+std::uint64_t read_flat_lru_prefix(
+    FlatLruCache& cache, const SimulationInput& input, std::uint64_t start, std::uint64_t end) {
+  std::uint64_t hit_tokens = 0;
+  for (std::uint64_t index = start; index < end; index += 1) {
+    const std::uint32_t node = input.prefix.node_for_event[index];
+    if (!cache.contains(node)) break;
+    cache.touch(node);
+    hit_tokens += input.tokens[index];
+  }
+  return hit_tokens;
+}
+
+void write_flat_lru_request(
+    FlatLruCache& cache, const SimulationInput& input, std::uint64_t start, std::uint64_t end) {
+  // Check live membership for the whole request, independently of the read.
+  // Do not restart if a later insertion evicts an earlier node.
+  for (std::uint64_t index = start; index < end; index += 1) {
+    cache.write(input.prefix.node_for_event[index]);
+  }
+}
+
+Result simulate_flat_lru(const SimulationInput& input, std::uint32_t capacity, const Options& options) {
+  if (capacity == 0 || input.ids.empty()) return no_cache_result(input, options);
+  Result result;
+  FlatLruCache cache(capacity);
+  bool full_before_measurement = false;
+  std::uint64_t start = 0;
+  for (std::uint64_t request = 0; request < input.request_ends.size(); request += 1) {
+    if (request >= options.warmup_requests && !full_before_measurement) return underfilled_result(input, options);
+    const std::uint64_t end = input.request_ends[request];
+    const std::uint64_t request_hits = read_flat_lru_prefix(cache, input, start, end);
+    if (request >= options.warmup_requests) {
+      result.hit_tokens += request_hits;
+      for (std::uint64_t index = start; index < end; index += 1) result.total_tokens += input.tokens[index];
+    }
+    write_flat_lru_request(cache, input, start, end);
+    if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
+    start = end;
+  }
+  if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
+  result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
+  return result;
+}
+
 struct HeapItem {
   std::uint32_t node = 0;
   std::uint32_t key = 0;
@@ -570,6 +647,7 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
 struct AllResults {
   Result fifo;
   Result lru;
+  Result flat_lru;
   Result optimal;
 };
 
@@ -577,6 +655,7 @@ AllResults simulate_all(const SimulationInput& input, std::uint32_t capacity, co
   return {
     simulate_fifo(input, capacity, options),
     simulate_trie_policy(input, capacity, false, options),
+    simulate_flat_lru(input, capacity, options),
     simulate_trie_policy(input, capacity, true, options),
   };
 }
@@ -623,6 +702,8 @@ void print_all_results(std::uint64_t cache_blocks, const AllResults& results, st
   print_named_result("fifo", cache_blocks, results.fifo, warmup_requests);
   std::cout << "},\"lru\":{";
   print_named_result("lru", cache_blocks, results.lru, warmup_requests);
+  std::cout << "},\"lru-flat\":{";
+  print_named_result("lru-flat", cache_blocks, results.flat_lru, warmup_requests);
   std::cout << "},\"optimal\":{";
   print_named_result("optimal", cache_blocks, results.optimal, warmup_requests);
   std::cout << "}}\n";
@@ -649,9 +730,11 @@ void print_batch_results(const SimulationInput& input, const Options& options) {
   for (std::uint32_t capacity : options.capacities) {
     Result fifo;
     Result lru;
+    Result flat_lru;
     Result optimal;
     if (has_policy(options, "fifo")) fifo = simulate_fifo(input, capacity, options);
     if (has_policy(options, "lru")) lru = simulate_trie_policy(input, capacity, false, options);
+    if (has_policy(options, "lru-flat")) flat_lru = simulate_flat_lru(input, capacity, options);
     if (has_policy(options, "optimal")) optimal = simulate_trie_policy(input, capacity, true, options);
 
     if (!first_point) std::cout << ",";
@@ -666,6 +749,11 @@ void print_batch_results(const SimulationInput& input, const Options& options) {
     if (has_policy(options, "lru")) {
       std::cout << ",\"lru\":{";
       print_named_result("lru", capacity, lru, options.warmup_requests);
+      std::cout << "}";
+    }
+    if (has_policy(options, "lru-flat")) {
+      std::cout << ",\"lru-flat\":{";
+      print_named_result("lru-flat", capacity, flat_lru, options.warmup_requests);
       std::cout << "}";
     }
     if (has_policy(options, "optimal")) {
@@ -699,6 +787,7 @@ int main(int argc, char** argv) {
     else if (options.policy == "ceiling") print_result("ceiling", options.capacity, simulate_ceiling(input, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "fifo") print_result("fifo", options.capacity, simulate_fifo(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "lru") print_result("lru", options.capacity, simulate_trie_policy(input, options.capacity, false, options), trie_node_count, options.warmup_requests);
+    else if (options.policy == "lru-flat") print_result("lru-flat", options.capacity, simulate_flat_lru(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "optimal") print_result("optimal", options.capacity, simulate_trie_policy(input, options.capacity, true, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "all") print_all_results(options.capacity, simulate_all(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else throw std::runtime_error("Unsupported policy: " + options.policy);

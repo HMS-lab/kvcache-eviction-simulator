@@ -37,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--block-size", type=int, default=None, help="Fallback block size when trace records omit block_size; record block_size overrides this value")
         command.add_argument("--estimate-tokens", type=int, default=None, help="Override calculator token count used for bytes/token")
         command.add_argument("--budgets-gib", default=",".join(str(v) for v in DEFAULT_BUDGETS_GIB), help="Comma-separated GiB budgets")
-        command.add_argument("--policies", default=",".join(DEFAULT_POLICIES), help="Comma-separated policies: fifo,lru,optimal")
+        command.add_argument("--policies", default=",".join(DEFAULT_POLICIES), help=f"Comma-separated policies: {','.join(DEFAULT_POLICIES)}")
         command.add_argument("--backend", choices=["cpp", "python"], default="cpp", help="Simulation backend (default: cpp)")
         command.add_argument("--jobs", type=int, default=1, help="Worker processes for the Python backend; ignored by the C++ backend")
         command.add_argument("--no-progress", action="store_true", help="Disable terminal progress output")

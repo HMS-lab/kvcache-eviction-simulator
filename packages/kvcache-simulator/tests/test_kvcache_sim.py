@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import gzip
 import json
+import random
 import shutil
 import subprocess
 import sys
@@ -10,9 +12,9 @@ import unittest
 from pathlib import Path
 
 from kvcache_sim.calculator import calculate_cache_size, load_models_data, models_by_id
-from kvcache_sim.cpp_backend import _build_path_for_source
+from kvcache_sim.cpp_backend import _build_path_for_source, _write_binary_trace, ensure_cpp_simulator, run_cpp_sweep
 from kvcache_sim.plan import build_execution_plan
-from kvcache_sim.policies import simulate_policy
+from kvcache_sim.policies import _FlatLruCache, _read_flat_lru_prefix, _write_flat_lru_request, simulate_policy
 from kvcache_sim._resources import package_resource_path, user_temp_suffix
 from kvcache_sim.simulator import run_sweep
 from kvcache_sim.trace import parse_trace_file, parse_trace_lines
@@ -239,6 +241,183 @@ class PrefixPolicyTests(unittest.TestCase):
         self.assertEqual(result.measurementMode, "underfilled_at_window")
 
 
+class FlatLruTests(unittest.TestCase):
+    def test_read_refresh_changes_the_fifo_victim(self) -> None:
+        plan = build_execution_plan(make_trace(["A"], ["B"], ["A"], ["C"], ["A"]))
+        self.assertEqual(simulate_policy(plan, "lru-flat", 2).hitRate, 2 / 3)
+        self.assertEqual(simulate_policy(plan, "fifo", 2).hitRate, 1 / 3)
+
+    def test_internal_node_eviction_leaves_an_unusable_tail(self) -> None:
+        plan = build_execution_plan(make_trace(["A", "B"], ["X"], ["A", "B"], ["A", "B"]))
+        self.assertEqual(simulate_policy(plan, "lru-flat", 2).hitTokens, 2)
+        self.assertEqual(simulate_policy(plan, "lru", 2).hitTokens, 3)
+
+    def test_same_raw_block_under_another_prefix_is_not_refreshed(self) -> None:
+        plan = build_execution_plan(make_trace(["X"], ["D", "C"], ["A", "B", "C"]))
+        x, _d, other_c, a, b, c = plan.node_for_event
+        self.assertNotEqual(other_c, c)
+        cache = _FlatLruCache(4)
+        for node in (x, other_c, a):
+            cache.write(node)
+
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 3, 6), 1)
+        self.assertEqual(list(cache.entries), [x, other_c, a])
+        _write_flat_lru_request(cache, plan, 3, 6)
+        self.assertEqual(list(cache.entries), [other_c, a, b, c])
+        # Rewriting the same exact nodes refreshes rather than duplicates them.
+        _write_flat_lru_request(cache, plan, 3, 6)
+        self.assertEqual(list(cache.entries), [other_c, a, b, c])
+        cache.write(x)
+        self.assertNotIn(other_c, cache)
+        self.assertIn(c, cache)
+
+    def test_existing_suffix_is_refreshed_only_when_written(self) -> None:
+        plan = build_execution_plan(make_trace(["A", "B", "C"], ["X"]))
+        a, b, c, x = plan.node_for_event
+        cache = _FlatLruCache(3)
+        for node in (c, x, a):
+            cache.write(node)
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 0, 3), 1)
+        self.assertEqual(list(cache.entries), [c, x, a])
+        # This is a write to the exact orphaned suffix node, not another raw C.
+        cache.write(c)
+        self.assertEqual(list(cache.entries), [x, a, c])
+        cache.write(b)
+        self.assertEqual(list(cache.entries), [a, c, b])
+
+    def test_writer_restores_nodes_evicted_after_the_read(self) -> None:
+        plan = build_execution_plan(make_trace(["A", "B"], ["X"]))
+        a, b, x = plan.node_for_event
+        cache = _FlatLruCache(2)
+        _write_flat_lru_request(cache, plan, 0, 2)
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 0, 2), 2)
+        cache.write(x)
+        self.assertNotIn(a, cache)
+        self.assertIn(b, cache)  # Evicting the parent did not discard its tail.
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 0, 2), 0)
+        _write_flat_lru_request(cache, plan, 0, 2)
+        self.assertEqual(list(cache.entries), [a, b])
+
+    def test_tail_write_can_evict_the_head_in_one_request(self) -> None:
+        plan = build_execution_plan(make_trace(["A", "B"], ["A", "B", "C"]))
+        a, b, c = plan.node_for_event[2:]
+        cache = _FlatLruCache(2)
+        _write_flat_lru_request(cache, plan, 0, 2)
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 2, 5), 2)
+        _write_flat_lru_request(cache, plan, 2, 5)
+        self.assertEqual(list(cache.entries), [b, c])
+        self.assertNotIn(a, cache)
+        result = simulate_policy(plan, "lru-flat", 2)
+        self.assertEqual((result.hitTokens, result.totalTokens), (2, 3))
+
+    def test_boundaries_and_weighted_prefix_hits(self) -> None:
+        weighted = parse_trace_lines([
+            json.dumps({"block_size": 8, "hash_ids": ["A", "B"], "input_length": 11, "block_tokens": [8, 3]}),
+            json.dumps({"block_size": 8, "hash_ids": ["A", "C"], "input_length": 10, "block_tokens": [8, 2]}),
+        ])
+        plan = build_execution_plan(weighted)
+        result = simulate_policy(plan, "lru-flat", 2)
+        self.assertEqual((result.hitTokens, result.totalTokens, result.hitRate), (8, 10, 0.8))
+        self.assertEqual(simulate_policy(plan, "lru-flat", 0).hitTokens, 0)
+        self.assertEqual(simulate_policy(plan, "lru-flat", 3).measurementMode, "underfilled_at_window")
+        self.assertEqual(simulate_policy(build_execution_plan(make_trace(["A"], ["A"])), "lru-flat", 1).hitRate, 1)
+        empty = replace(weighted, ids=[], tokens=[], request_starts=[0], request_count=0,
+                        unique_raw_blocks=0, total_input_tokens=0, average_input_tokens=0.0)
+        self.assertEqual(simulate_policy(build_execution_plan(empty), "lru-flat", 1).totalTokens, 0)
+        cache = _FlatLruCache(1)
+        _write_flat_lru_request(cache, plan, 0, 2)
+        self.assertEqual(len(cache), 1)
+        self.assertIn(plan.node_for_event[1], cache)
+
+    @unittest.skipUnless(shutil.which("c++"), "C++ compiler is not available")
+    def test_native_read_and_write_operations(self) -> None:
+        # Include the core in one translation unit to exercise private operations
+        # between read and write, without introducing a cache-seeding CLI option.
+        source = package_resource_path("kv-cache-lab-native-sim.cc")
+        harness = r'''
+#include <cassert>
+#define main simulator_cli_main
+#include SOURCE_PATH
+#undef main
+int main() {
+  SimulationInput input;
+  input.ids = {0, 1, 2, 3, 4, 2};  // X | D C | A B C
+  input.tokens = {1, 1, 1, 1, 1, 1};
+  input.request_ends = {1, 3, 6};
+  input.prefix = build_prefix_plan(input.ids, input.request_ends);
+  const auto& nodes = input.prefix.node_for_event;
+  const auto x = nodes[0], other_c = nodes[2], a = nodes[3], b = nodes[4], c = nodes[5];
+  FlatLruCache cache(4);
+  cache.write(x); cache.write(other_c); cache.write(a);
+  assert(read_flat_lru_prefix(cache, input, 3, 6) == 1);
+  write_flat_lru_request(cache, input, 3, 6);
+  assert(cache.size() == 4 && cache.contains(other_c) && cache.contains(c));
+  cache.write(x);
+  assert(!cache.contains(other_c) && cache.contains(c));
+
+  FlatLruCache small(2);
+  write_flat_lru_request(small, input, 3, 5);
+  assert(read_flat_lru_prefix(small, input, 3, 5) == 2);
+  small.write(x);
+  assert(!small.contains(a) && small.contains(b));
+  assert(read_flat_lru_prefix(small, input, 3, 5) == 0);
+  write_flat_lru_request(small, input, 3, 5);
+  assert(small.contains(a) && small.contains(b));
+  write_flat_lru_request(small, input, 3, 6);
+  assert(small.size() == 2 && !small.contains(a) && small.contains(b) && small.contains(c));
+}
+'''.replace("SOURCE_PATH", json.dumps(str(source)))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "flat-lru-test.cc"
+            binary = Path(tmpdir) / "flat-lru-test"
+            path.write_text(harness, encoding="utf-8")
+            subprocess.run([shutil.which("c++"), "-std=c++17", str(path), "-o", str(binary)], check=True, capture_output=True, text=True)
+            subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=10)
+
+    @unittest.skipUnless(shutil.which("c++"), "C++ compiler is not available")
+    def test_cpp_matches_python_across_traces_and_capacities(self) -> None:
+        rng = random.Random(42)
+        traces = [
+            make_trace(["A"], ["B"], ["A"], ["C"], ["A"]),
+            make_trace(["A", "B"], ["X"], ["A", "B"], ["A", "B"]),
+            make_trace(["A", "B"], ["A", "B", "C"]),
+            make_trace(["A"], ["A"]),
+        ]
+        for _ in range(8):
+            traces.append(parse_trace_lines([
+                json.dumps({"block_size": 8, "hash_ids": [rng.choice("ABCD") for _ in range(length)],
+                            "input_length": length * 8 - 3})
+                for length in [rng.randint(1, 6) for _ in range(24)]
+            ]))
+        for trace in traces:
+            for warmup_fraction in (0, 0.5, 1):
+                plan = build_execution_plan(trace, warmup_fraction)
+                native = run_cpp_sweep(trace, capacities=[0, 1, 2, 4, 100], policies=["lru-flat"], warmup_requests=plan.warmup_requests)
+                for capacity in (0, 1, 2, 4, 100):
+                    with self.subTest(events=len(trace.ids), warmup=warmup_fraction, capacity=capacity):
+                        self.assertEqual(native.results[("lru-flat", capacity)], simulate_policy(plan, "lru-flat", capacity))
+
+    @unittest.skipUnless(shutil.which("c++"), "C++ compiler is not available")
+    def test_native_single_batch_and_all_modes(self) -> None:
+        trace = make_trace(["A", "B"], ["X"], ["A", "B"], ["A", "B"])
+        binary = ensure_cpp_simulator()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = _write_binary_trace(trace, Path(tmpdir))
+            base = [str(binary), "--ids", str(files.ids), "--tokens", str(files.tokens),
+                    "--request-ends", str(files.request_ends), "--request-count", "4",
+                    "--total-blocks", str(len(trace.ids)), "--warmup-requests", "2", "--capacity", "2"]
+            def run(*args):
+                return json.loads(subprocess.run(base + list(args), check=True, capture_output=True, text=True).stdout)
+            single = run("--policy", "lru-flat")
+            all_results = run("--policy", "all")
+            batch = run("--policy", "batch", "--capacities", "2", "--policies", "lru-flat")
+            default_batch = run("--policy", "batch", "--capacities", "2")
+        self.assertEqual(single["hitTokens"], 2)
+        self.assertEqual(all_results["lru-flat"]["hitTokens"], 2)
+        self.assertEqual(set(batch["points"][0]), {"cacheBlocks", "lru-flat"})
+        self.assertEqual(set(default_batch["points"][0]), {"cacheBlocks", "fifo", "lru", "lru-flat", "optimal"})
+
+
 class SweepAndCliTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -357,10 +536,22 @@ class SweepAndCliTests(unittest.TestCase):
 
             table = subprocess.run(base, cwd=Path(__file__).resolve().parents[1], check=True, text=True, capture_output=True)
             as_json = subprocess.run(base + ["--format", "json"], cwd=Path(__file__).resolve().parents[1], check=True, text=True, capture_output=True)
+            selected = subprocess.run(base + ["--policies", "lru-flat", "--format", "json"], cwd=PACKAGE_ROOT, check=True, text=True, capture_output=True)
+            if shutil.which("c++"):
+                # Omit --backend to exercise the default native backend.
+                native = subprocess.run(base[:-2] + ["--format", "json"], cwd=PACKAGE_ROOT, check=True, text=True, capture_output=True)
+                self.assertEqual(json.loads(native.stdout)["points"], json.loads(as_json.stdout)["points"])
 
         self.assertIn("Budget", table.stdout)
         self.assertIn("FIFO hit", table.stdout)
+        self.assertIn("LRU-FLAT hit", table.stdout)
+        self.assertIn("LRU-FLAT speedup", table.stdout)
         parsed = json.loads(as_json.stdout)
+        self.assertEqual(parsed["policies"], ["fifo", "lru", "lru-flat", "optimal"])
+        self.assertIn("idealPrefillSpeedup", parsed["points"][0]["results"]["lru-flat"])
+        selected_result = json.loads(selected.stdout)
+        self.assertEqual(selected_result["policies"], ["lru-flat"])
+        self.assertEqual(set(selected_result["points"][0]["results"]), {"lru-flat"})
         self.assertEqual(parsed["metadata"]["modelId"], "qwen3-32b")
         self.assertEqual(parsed["points"][0]["cacheBlocks"], 1)
         self.assertIn("Measurement: hit rates use the last 50% of requests", table.stdout)
