@@ -7,6 +7,12 @@ import heapq
 from .plan import ExecutionPlan
 
 
+def validate_hyper_clock_max_score(max_score: int) -> int:
+    if isinstance(max_score, bool) or not isinstance(max_score, int) or not 1 <= max_score <= 2**64 - 1:
+        raise ValueError("hyper_clock_max_score must be a positive integer in 1..2^64-1")
+    return max_score
+
+
 @dataclass
 class PolicyResult:
     policy: str
@@ -189,6 +195,112 @@ def simulate_flat_lru(plan: ExecutionPlan, capacity: int) -> PolicyResult:
     return _finish("lru-flat", capacity, plan, hit_tokens, plan.total_measured_tokens)
 
 
+@dataclass
+class _ClockSlot:
+    node: int | None = None
+    score: int = 0
+
+
+class _HyperClockCache:
+    """Stable prefix-node slots; only victim selection ages resident scores."""
+
+    def __init__(self, capacity: int, max_score: int = 3) -> None:
+        self.capacity = capacity
+        self.max_score = validate_hyper_clock_max_score(max_score)
+        self.entries: dict[int, int] = {}
+        self.slots: list[_ClockSlot] = []
+        self.free_slots: list[int] = []
+        self.hand = 0
+
+    def __contains__(self, node: int) -> bool:
+        return node in self.entries
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def lookup(self, node: int) -> bool:
+        index = self.entries.get(node)
+        if index is None:
+            return False
+        slot = self.slots[index]
+        slot.score = min(slot.score + 1, self.max_score)
+        return True
+
+    def discard(self, node: int) -> None:
+        index = self.entries.pop(node, None)
+        if index is not None:
+            self.slots[index] = _ClockSlot()
+            self.free_slots.append(index)
+
+    def evict(self) -> int:
+        if not self.entries:
+            raise RuntimeError("Hyper Clock victim selection requires a resident entry")
+        while True:
+            index = self.hand
+            self.hand = (self.hand + 1) % len(self.slots)
+            slot = self.slots[index]
+            if slot.node is None:
+                continue
+            if slot.score > 0:
+                slot.score -= 1
+                continue
+            victim = slot.node
+            self.discard(victim)
+            return victim
+
+    def write(self, node: int) -> None:
+        if self.capacity <= 0 or self.lookup(node):
+            return
+        if len(self) >= self.capacity:
+            self.evict()
+        if self.free_slots:
+            index = self.free_slots.pop()
+            self.slots[index] = _ClockSlot(node, 1)
+        else:
+            index = len(self.slots)
+            self.slots.append(_ClockSlot(node, 1))
+        self.entries[node] = index
+
+
+def _read_hyper_clock_prefix(cache: _HyperClockCache, plan: ExecutionPlan, start: int, end: int) -> tuple[int, int]:
+    hit_tokens = 0
+    for index in range(start, end):
+        if not cache.lookup(plan.node_for_event[index]):
+            return hit_tokens, index
+        hit_tokens += plan.tokens[index]
+    return hit_tokens, end
+
+
+def _write_hyper_clock_suffix(cache: _HyperClockCache, plan: ExecutionPlan, start: int, end: int) -> None:
+    # Consult live membership: earlier writes may have evicted later suffix nodes.
+    # Never restart repairs or rewrite the prefix already consumed by the read.
+    for index in range(start, end):
+        cache.write(plan.node_for_event[index])
+
+
+def simulate_hyper_clock(plan: ExecutionPlan, capacity: int, *, max_score: int = 3) -> PolicyResult:
+    validate_hyper_clock_max_score(max_score)
+    if capacity <= 0 or not plan.ids:
+        return _no_cache("hyper-clock", capacity, plan)
+    cache = _HyperClockCache(capacity, max_score)
+    full_before_measurement = False
+    hit_tokens = 0
+    for request_index in range(plan.request_count):
+        if request_index >= plan.warmup_requests and not full_before_measurement:
+            return _underfilled("hyper-clock", capacity, plan)
+        start = plan.request_starts[request_index]
+        end = plan.request_starts[request_index + 1]
+        request_hits, write_start = _read_hyper_clock_prefix(cache, plan, start, end)
+        if request_index >= plan.warmup_requests:
+            hit_tokens += request_hits
+        _write_hyper_clock_suffix(cache, plan, write_start, end)
+        if request_index < plan.warmup_requests and len(cache) >= capacity:
+            full_before_measurement = True
+    if not full_before_measurement or plan.total_measured_tokens <= 0:
+        return _underfilled("hyper-clock", capacity, plan)
+    return _finish("hyper-clock", capacity, plan, hit_tokens, plan.total_measured_tokens)
+
+
 class _LeafHeap:
     def __init__(self, max_heap: bool) -> None:
         self.max_heap = max_heap
@@ -346,13 +458,16 @@ def simulate_trie_policy(plan: ExecutionPlan, capacity: int, *, optimal: bool) -
     return _finish(policy, capacity, plan, hit_tokens, total_tokens)
 
 
-def simulate_policy(plan: ExecutionPlan, policy: str, capacity: int) -> PolicyResult:
+def simulate_policy(plan: ExecutionPlan, policy: str, capacity: int, *, hyper_clock_max_score: int = 3) -> PolicyResult:
+    validate_hyper_clock_max_score(hyper_clock_max_score)
     if policy == "fifo":
         return simulate_fifo(plan, capacity)
     if policy == "lru":
         return simulate_trie_policy(plan, capacity, optimal=False)
     if policy == "lru-flat":
         return simulate_flat_lru(plan, capacity)
+    if policy == "hyper-clock":
+        return simulate_hyper_clock(plan, capacity, max_score=hyper_clock_max_score)
     if policy == "optimal":
         return simulate_trie_policy(plan, capacity, optimal=True)
     raise ValueError(f"Unsupported policy: {policy}")

@@ -8,11 +8,11 @@ from typing import Any, Callable
 from .calculator import BYTES_PER_GIB, calculate_cache_size, load_models_data, models_by_id
 from .cpp_backend import run_cpp_sweep
 from .plan import ExecutionPlan, build_execution_plan
-from .policies import PolicyResult, simulate_ceiling, simulate_policy
+from .policies import PolicyResult, simulate_ceiling, simulate_policy, validate_hyper_clock_max_score
 from .trace import TraceData
 
 DEFAULT_BUDGETS_GIB = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-DEFAULT_POLICIES = ["fifo", "lru", "lru-flat", "optimal"]
+DEFAULT_POLICIES = ["fifo", "lru", "lru-flat", "hyper-clock", "optimal"]
 THROUGHPUT_EPSILON = 0.001
 THROUGHPUT_DISPLAY_CAP = 1000.0
 
@@ -38,25 +38,25 @@ def cache_blocks_for_gib(gib: float, bytes_per_block: float) -> int:
     return max(0, math.floor(gib * BYTES_PER_GIB / bytes_per_block))
 
 
-def _worker_simulate(task: tuple[str, int]) -> tuple[tuple[str, int], PolicyResult]:
+def _worker_simulate(task: tuple[str, int, int]) -> tuple[tuple[str, int], PolicyResult]:
     if _WORKER_PLAN is None:
         raise RuntimeError("Worker plan is not initialized")
-    policy, capacity = task
-    return task, simulate_policy(_WORKER_PLAN, policy, capacity)
+    policy, capacity, max_score = task
+    return (policy, capacity), simulate_policy(_WORKER_PLAN, policy, capacity, hyper_clock_max_score=max_score)
 
 
-def _simulate_tasks(plan: ExecutionPlan, tasks: list[tuple[str, int]], jobs: int) -> dict[tuple[str, int], PolicyResult]:
+def _simulate_tasks(plan: ExecutionPlan, tasks: list[tuple[str, int]], jobs: int, *, hyper_clock_max_score: int = 3) -> dict[tuple[str, int], PolicyResult]:
     if not tasks:
         return {}
     if jobs <= 1 or "fork" not in mp.get_all_start_methods():
-        return {task: simulate_policy(plan, task[0], task[1]) for task in tasks}
+        return {task: simulate_policy(plan, task[0], task[1], hyper_clock_max_score=hyper_clock_max_score) for task in tasks}
 
     global _WORKER_PLAN
     _WORKER_PLAN = plan
     context = mp.get_context("fork")
     try:
         with context.Pool(processes=min(jobs, len(tasks))) as pool:
-            return dict(pool.imap_unordered(_worker_simulate, tasks))
+            return dict(pool.imap_unordered(_worker_simulate, ((policy, capacity, hyper_clock_max_score) for policy, capacity in tasks)))
     finally:
         _WORKER_PLAN = None
 
@@ -90,6 +90,7 @@ def run_sweep(
     indexer_precision: str | None = None,
     budgets_gib: list[float] | None = None,
     policies: list[str] | None = None,
+    hyper_clock_max_score: int = 3,
     jobs: int = 1,
     backend: str = "cpp",
     progress: ProgressCallback | None = None,
@@ -97,7 +98,11 @@ def run_sweep(
     estimate_tokens: int | None = None,
     include_draft_kv_cache: bool = False,
     models_data: dict[str, Any] | None = None,
+    release_trace_data: bool = False,
 ) -> dict[str, Any]:
+    """Simulate budgets; release_trace_data consumes event lists on the C++ backend."""
+    validate_hyper_clock_max_score(hyper_clock_max_score)
+    event_count = len(trace.ids)
     data = models_data or load_models_data()
     models = models_by_id(data)
     if model_id not in models:
@@ -143,6 +148,8 @@ def run_sweep(
             capacities=cpp_capacities,
             policies=selected_policies,
             warmup_requests=warmup_requests,
+            hyper_clock_max_score=hyper_clock_max_score,
+            release_trace_data=release_trace_data,
             progress=cpp_progress,
         )
         unique_blocks = cpp_result.unique_blocks
@@ -167,7 +174,7 @@ def run_sweep(
                     tasks.append(task)
         if progress:
             progress(3, 4, "running Python simulation")
-        sim_results = _simulate_tasks(plan, tasks, max(1, int(jobs or 1)))
+        sim_results = _simulate_tasks(plan, tasks, max(1, int(jobs or 1)), hyper_clock_max_score=hyper_clock_max_score)
         ceiling = simulate_ceiling(plan)
     points: list[dict[str, Any]] = []
     for gib, capacity in capacities:
@@ -193,6 +200,7 @@ def run_sweep(
 
     return {
         "metadata": {
+            **({"policyParameters": {"hyper-clock": {"maxScore": hyper_clock_max_score}}} if "hyper-clock" in selected_policies else {}),
             "modelId": cache_size.model_id,
             "modelLabel": cache_size.model_label,
             "precision": cache_size.precision,
@@ -205,7 +213,7 @@ def run_sweep(
             "bytesPerBlock": bytes_per_block,
             "estimateTokens": accounting_tokens,
             "requestCount": trace.request_count,
-            "eventCount": len(trace.ids),
+            "eventCount": event_count,
             "rawUniqueBlocks": trace.unique_raw_blocks,
             "uniqueBlocks": unique_blocks,
             "backend": backend,

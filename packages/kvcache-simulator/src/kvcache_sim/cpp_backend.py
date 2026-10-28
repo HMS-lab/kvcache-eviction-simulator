@@ -12,7 +12,7 @@ import tempfile
 import threading
 from typing import Callable, Iterable
 
-from .policies import PolicyResult
+from .policies import PolicyResult, validate_hyper_clock_max_score
 from ._resources import package_resource_path, user_temp_suffix
 from .trace import TraceData
 
@@ -84,6 +84,7 @@ def _write_binary_trace(trace: TraceData, directory: Path) -> _BinaryTraceFiles:
     _write_array(ids_path, "I", trace.ids)
     _write_array(tokens_path, "H", trace.tokens)
     _write_array(request_ends_path, "I", trace.request_starts[1:])
+
     return _BinaryTraceFiles(ids=ids_path, tokens=tokens_path, request_ends=request_ends_path)
 
 
@@ -133,8 +134,13 @@ def run_cpp_sweep(
     capacities: list[int],
     policies: list[str],
     warmup_requests: int,
+    hyper_clock_max_score: int = 3,
+    release_trace_data: bool = False,
     progress: ProgressCallback | None = None,
 ) -> CppSweepResult:
+    """Run native replay; optionally consume the trace's event lists after writing."""
+    validate_hyper_clock_max_score(hyper_clock_max_score)
+    event_count = len(trace.ids)
     binary = ensure_cpp_simulator(progress)
     safe_capacities = []
     for capacity in capacities:
@@ -149,6 +155,12 @@ def run_cpp_sweep(
         if progress:
             progress(0, max(1, len(safe_capacities) + 2), "writing binary trace")
         files = _write_binary_trace(trace, Path(tmpdir))
+        if release_trace_data:
+            # Keep scalar metadata, but drop the large lists before C++ loads
+            # its own arrays. Reassignment also keeps TraceData's field types.
+            trace.ids = []
+            trace.tokens = []
+            trace.request_starts = []
         command = [
             str(binary),
             "--policy",
@@ -162,9 +174,11 @@ def run_cpp_sweep(
             "--request-count",
             str(trace.request_count),
             "--total-blocks",
-            str(len(trace.ids)),
+            str(event_count),
             "--warmup-requests",
             str(warmup_requests),
+            "--hyper-clock-max-score",
+            str(hyper_clock_max_score),
             "--capacities",
             ",".join(str(capacity) for capacity in safe_capacities),
             "--policies",

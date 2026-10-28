@@ -7,6 +7,7 @@ import sys
 from .calculator import load_models_data, models_by_id
 from .formatting import render_json, render_table
 from .progress import ProgressBar
+from .policies import validate_hyper_clock_max_score
 from .simulator import DEFAULT_BUDGETS_GIB, DEFAULT_POLICIES, run_sweep
 from .trace import parse_trace_file
 
@@ -21,6 +22,13 @@ def _parse_csv_strings(value: str) -> list[str]:
     if not value:
         return []
     return [part.strip().lower() for part in value.split(",") if part.strip()]
+
+
+def _parse_hyper_clock_max_score(value: str) -> int:
+    try:
+        return validate_hyper_clock_max_score(int(value))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--estimate-tokens", type=int, default=None, help="Override calculator token count used for bytes/token")
         command.add_argument("--budgets-gib", default=",".join(str(v) for v in DEFAULT_BUDGETS_GIB), help="Comma-separated GiB budgets")
         command.add_argument("--policies", default=",".join(DEFAULT_POLICIES), help=f"Comma-separated policies: {','.join(DEFAULT_POLICIES)}")
+        command.add_argument("--hyper-clock-max-score", type=_parse_hyper_clock_max_score, default=3, help="Hyper Clock maximum score, a positive integer (default: 3)")
         command.add_argument("--backend", choices=["cpp", "python"], default="cpp", help="Simulation backend (default: cpp)")
         command.add_argument("--jobs", type=int, default=1, help="Worker processes for the Python backend; ignored by the C++ backend")
         command.add_argument("--no-progress", action="store_true", help="Disable terminal progress output")
@@ -80,6 +89,8 @@ def run_sweep_command(args: argparse.Namespace) -> int:
             indexer_precision=args.indexer_precision,
             budgets_gib=_parse_csv_numbers(args.budgets_gib),
             policies=_parse_csv_strings(args.policies),
+            hyper_clock_max_score=args.hyper_clock_max_score,
+            release_trace_data=True,
             jobs=args.jobs,
             backend=args.backend,
             progress=progress.update,

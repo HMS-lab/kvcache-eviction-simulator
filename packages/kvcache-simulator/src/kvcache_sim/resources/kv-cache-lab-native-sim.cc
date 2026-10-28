@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -28,6 +29,7 @@ struct Options {
   std::uint64_t request_count = 0;
   std::uint64_t warmup_requests = 0;
   std::uint32_t capacity = 0;
+  std::uint64_t hyper_clock_max_score = 3;
   std::vector<std::uint32_t> capacities;
   std::vector<std::string> policies;
   bool progress = false;
@@ -57,6 +59,15 @@ std::uint64_t parse_u64(const char* value, const std::string& name) {
   const unsigned long long parsed = std::strtoull(value, &end, 10);
   if (end && *end != '\0') throw std::runtime_error("Invalid integer for " + name);
   return static_cast<std::uint64_t>(parsed);
+}
+
+std::uint64_t parse_clock_score(const std::string& value) {
+  std::uint64_t score = 0;
+  const auto result = std::from_chars(value.data(), value.data() + value.size(), score);
+  if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || score == 0) {
+    throw std::runtime_error("--hyper-clock-max-score must be a positive integer in 1..2^64-1");
+  }
+  return score;
 }
 
 std::vector<std::uint32_t> parse_u32_csv(const std::string& value, const std::string& name) {
@@ -102,11 +113,12 @@ Options parse_args(int argc, char** argv) {
     else if (arg == "--capacity") options.capacity = static_cast<std::uint32_t>(parse_u64(require_value(arg), arg));
     else if (arg == "--capacities") options.capacities = parse_u32_csv(require_value(arg), arg);
     else if (arg == "--policies") options.policies = parse_string_csv(require_value(arg));
+    else if (arg == "--hyper-clock-max-score") options.hyper_clock_max_score = parse_clock_score(require_value(arg));
     else if (arg == "--progress") options.progress = true;
     else throw std::runtime_error("Unknown argument: " + arg);
   }
   if (options.policy.empty() || options.ids_path.empty() || options.tokens_path.empty() || options.total_blocks == 0) {
-    throw std::runtime_error("Usage: kv-cache-lab-native-sim --policy fifo|lru|lru-flat|optimal|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--next PATH]");
+    throw std::runtime_error("Usage: kv-cache-lab-native-sim --policy fifo|lru|lru-flat|hyper-clock|optimal|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--hyper-clock-max-score N] [--next PATH]");
   }
   if (options.policy != "build-next" && (options.request_ends_path.empty() || options.request_count == 0)) {
     throw std::runtime_error("--request-ends and --request-count are required");
@@ -222,6 +234,17 @@ struct SimulationInput {
 
 PrefixPlan build_prefix_plan(const std::vector<std::uint32_t>& ids,
                              const std::vector<std::uint32_t>& request_ends) {
+  std::uint64_t previous_end = 0;
+  for (const auto end : request_ends) {
+    if (end < previous_end || end > ids.size()) {
+      throw std::runtime_error("Invalid request end offset " + std::to_string(end) +
+        ": offsets must be nondecreasing and within --total-blocks (" + std::to_string(ids.size()) + ")");
+    }
+    previous_end = end;
+  }
+  if (previous_end != ids.size()) {
+    throw std::runtime_error("Final request end offset must equal --total-blocks");
+  }
   PrefixPlan plan;
   plan.node_for_event.resize(ids.size());
   plan.next_request_for_event.resize(ids.size());
@@ -460,6 +483,121 @@ Result simulate_flat_lru(const SimulationInput& input, std::uint32_t capacity, c
   return result;
 }
 
+// Internal state mirrors the Python cache. Node zero is the uncached trie root.
+struct HyperClockCache {
+  struct Slot {
+    std::uint32_t node = 0;
+    std::uint64_t score = 0;
+  };
+
+  std::uint32_t capacity;
+  std::uint64_t max_score;
+  std::unordered_map<std::uint32_t, std::size_t> entries;
+  std::vector<Slot> slots;
+  std::vector<std::size_t> free_slots;
+  std::size_t hand = 0;
+
+  explicit HyperClockCache(std::uint32_t capacity, std::uint64_t max_score = 3)
+      : capacity(capacity), max_score(max_score) {
+    if (max_score == 0) throw std::runtime_error("Hyper Clock max score must be positive");
+  }
+
+  bool contains(std::uint32_t node) const { return entries.find(node) != entries.end(); }
+  std::size_t size() const { return entries.size(); }
+
+  bool lookup(std::uint32_t node) {
+    const auto found = entries.find(node);
+    if (found == entries.end()) return false;
+    auto& score = slots[found->second].score;
+    if (score < max_score) ++score;  // Avoid overflow even at UINT64_MAX.
+    return true;
+  }
+
+  void discard(std::uint32_t node) {
+    const auto found = entries.find(node);
+    if (found == entries.end()) return;
+    const auto index = found->second;
+    entries.erase(found);
+    slots[index] = Slot{};
+    free_slots.push_back(index);
+  }
+
+  std::uint32_t evict() {
+    if (entries.empty()) throw std::runtime_error("Hyper Clock victim selection requires a resident entry");
+    while (true) {
+      const auto index = hand;
+      hand = (hand + 1) % slots.size();
+      auto& slot = slots[index];
+      if (slot.node == 0) continue;
+      if (slot.score > 0) {
+        --slot.score;
+        continue;
+      }
+      const auto victim = slot.node;
+      discard(victim);
+      return victim;
+    }
+  }
+
+  void write(std::uint32_t node) {
+    if (capacity == 0 || lookup(node)) return;
+    if (size() >= capacity) evict();
+    std::size_t index;
+    if (!free_slots.empty()) {
+      index = free_slots.back();
+      free_slots.pop_back();
+      slots[index] = Slot{node, 1};
+    } else {
+      index = slots.size();
+      slots.push_back(Slot{node, 1});
+    }
+    entries.emplace(node, index);
+  }
+};
+
+struct ClockPrefixRead {
+  std::uint64_t hit_tokens;
+  std::uint64_t write_start;
+};
+
+ClockPrefixRead read_hyper_clock_prefix(
+    HyperClockCache& cache, const SimulationInput& input, std::uint64_t start, std::uint64_t end) {
+  std::uint64_t hits = 0;
+  for (auto index = start; index < end; ++index) {
+    if (!cache.lookup(input.prefix.node_for_event[index])) return {hits, index};
+    hits += input.tokens[index];
+  }
+  return {hits, end};
+}
+
+void write_hyper_clock_suffix(
+    HyperClockCache& cache, const SimulationInput& input, std::uint64_t start, std::uint64_t end) {
+  for (auto index = start; index < end; ++index) cache.write(input.prefix.node_for_event[index]);
+}
+
+Result simulate_hyper_clock(const SimulationInput& input, std::uint32_t capacity, const Options& options) {
+  if (capacity == 0 || input.ids.empty()) return no_cache_result(input, options);
+  Result result;
+  HyperClockCache cache(capacity, options.hyper_clock_max_score);
+  bool full_before_measurement = false;
+  std::uint64_t start = 0;
+  for (std::uint64_t request = 0; request < input.request_ends.size(); ++request) {
+    if (request >= options.warmup_requests && !full_before_measurement) return underfilled_result(input, options);
+    const auto end = input.request_ends[request];
+    const auto read = read_hyper_clock_prefix(cache, input, start, end);
+    if (request >= options.warmup_requests) {
+      result.hit_tokens += read.hit_tokens;
+      for (auto index = start; index < end; ++index) result.total_tokens += input.tokens[index];
+    }
+    write_hyper_clock_suffix(cache, input, read.write_start, end);
+    if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
+    start = end;
+  }
+  if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
+  result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
+  return result;
+}
+
 struct HeapItem {
   std::uint32_t node = 0;
   std::uint32_t key = 0;
@@ -648,6 +786,7 @@ struct AllResults {
   Result fifo;
   Result lru;
   Result flat_lru;
+  Result hyper_clock;
   Result optimal;
 };
 
@@ -656,6 +795,7 @@ AllResults simulate_all(const SimulationInput& input, std::uint32_t capacity, co
     simulate_fifo(input, capacity, options),
     simulate_trie_policy(input, capacity, false, options),
     simulate_flat_lru(input, capacity, options),
+    simulate_hyper_clock(input, capacity, options),
     simulate_trie_policy(input, capacity, true, options),
   };
 }
@@ -704,6 +844,8 @@ void print_all_results(std::uint64_t cache_blocks, const AllResults& results, st
   print_named_result("lru", cache_blocks, results.lru, warmup_requests);
   std::cout << "},\"lru-flat\":{";
   print_named_result("lru-flat", cache_blocks, results.flat_lru, warmup_requests);
+  std::cout << "},\"hyper-clock\":{";
+  print_named_result("hyper-clock", cache_blocks, results.hyper_clock, warmup_requests);
   std::cout << "},\"optimal\":{";
   print_named_result("optimal", cache_blocks, results.optimal, warmup_requests);
   std::cout << "}}\n";
@@ -731,10 +873,12 @@ void print_batch_results(const SimulationInput& input, const Options& options) {
     Result fifo;
     Result lru;
     Result flat_lru;
+    Result hyper_clock;
     Result optimal;
     if (has_policy(options, "fifo")) fifo = simulate_fifo(input, capacity, options);
     if (has_policy(options, "lru")) lru = simulate_trie_policy(input, capacity, false, options);
     if (has_policy(options, "lru-flat")) flat_lru = simulate_flat_lru(input, capacity, options);
+    if (has_policy(options, "hyper-clock")) hyper_clock = simulate_hyper_clock(input, capacity, options);
     if (has_policy(options, "optimal")) optimal = simulate_trie_policy(input, capacity, true, options);
 
     if (!first_point) std::cout << ",";
@@ -754,6 +898,11 @@ void print_batch_results(const SimulationInput& input, const Options& options) {
     if (has_policy(options, "lru-flat")) {
       std::cout << ",\"lru-flat\":{";
       print_named_result("lru-flat", capacity, flat_lru, options.warmup_requests);
+      std::cout << "}";
+    }
+    if (has_policy(options, "hyper-clock")) {
+      std::cout << ",\"hyper-clock\":{";
+      print_named_result("hyper-clock", capacity, hyper_clock, options.warmup_requests);
       std::cout << "}";
     }
     if (has_policy(options, "optimal")) {
@@ -788,6 +937,7 @@ int main(int argc, char** argv) {
     else if (options.policy == "fifo") print_result("fifo", options.capacity, simulate_fifo(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "lru") print_result("lru", options.capacity, simulate_trie_policy(input, options.capacity, false, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "lru-flat") print_result("lru-flat", options.capacity, simulate_flat_lru(input, options.capacity, options), trie_node_count, options.warmup_requests);
+    else if (options.policy == "hyper-clock") print_result("hyper-clock", options.capacity, simulate_hyper_clock(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "optimal") print_result("optimal", options.capacity, simulate_trie_policy(input, options.capacity, true, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "all") print_all_results(options.capacity, simulate_all(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else throw std::runtime_error("Unsupported policy: " + options.policy);

@@ -13,11 +13,10 @@ The default simulation backend compiles and runs a bundled C++ replay core on fi
 ## Quick Start
 
 ```bash
-kvcache-simulator run \
-  --trace trace.jsonl.gz \
-  --model glm-5.2 \
-  --kv-precision fp8_int8 \
-  --indexer-precision fp4_int4
+ kvcache-simulator run  --trace ~/ai_traces/mooncake_trace.jsonl  --model glm-5.2  --kv-precision fp8_int8  --indexer-precision fp4_int4 --block-size 512
+
+ kvcache-simulator run  --trace ~/ai_traces/semianalysis_converted_concurrency_10.jsonl  --model glm-5.2  --kv-precision fp8_int8  --indexer-precision fp4_int4 --block-size 512 --hyper-clock-max-score 3
+
 ```
 
 The default output is a readable table. Use `--format json` when another script needs to consume the result.
@@ -101,7 +100,8 @@ Scheduling uses recorded execution times to construct a workload; it does not pr
 | `--block-size N` | Fallback block size when trace records omit `block_size`; trace-declared `block_size` overrides it. |
 | `--estimate-tokens N` | Override the token count used for token-dependent bytes/token formulas. By default the trace average input length is used. |
 | `--budgets-gib A,B,C` | Comma-separated KV cache memory budgets in GiB. Default matches the web budget sweep: `1,2,4,...,16384`. |
-| `--policies fifo,lru,lru-flat,optimal` | Eviction policies to simulate. Defaults to all four. |
+| `--policies fifo,lru,lru-flat,hyper-clock,optimal` | Eviction policies to simulate. Defaults to all five. |
+| `--hyper-clock-max-score N` | Hyper Clock score limit; default `3`. Must be an integer in `1..2^64-1`. |
 | `--backend cpp\|python` | Simulation backend. Default is `cpp`; use `python` for debugging or machines without a compiler. |
 | `--jobs N` | Number of worker processes for the Python backend. The C++ backend runs one batch process and ignores this option. |
 | `--no-progress` | Disable terminal progress output. Progress is written to stderr only when stderr is interactive, so JSON stdout stays valid. |
@@ -118,6 +118,65 @@ Flat LRU processes each request with separate read and write passes. Reading ref
 
 Flat LRU appears as `LRU-FLAT hit` and `LRU-FLAT speedup` in the default table and as `lru-flat` in JSON results. To run only this policy, add `--policies lru-flat` with either backend.
 
+### Hyper Clock
+
+`hyper-clock` keeps blocks in stable array slots and chooses victims by circular scanning. Each new block starts with score `1`. A lookup hit or a write to an existing block increases its score by one, saturating at `--hyper-clock-max-score` (default `3`). Hits leave the block's position and clock hand unchanged. Scores do not age with timestamps, misses, or insertion into free space.
+
+When full, the cache repeatedly inspects the slot at the hand and advances the hand to the next slot, wrapping around as needed. Empty slots are skipped. An occupied slot with a positive score loses one point and survives that visit, including a change from `1` to `0`. An occupied slot already at zero is evicted. The hand stays at the next slot for the next victim search. No entries are pinned, and ancestors and descendants are equally eligible for eviction.
+
+With `max_score=1`, this is one-bit second-chance CLOCK. An entry with score `S` and no further accesses survives `S` decrementing visits and is evicted on the following visit. Lookup and score refresh are O(1) on average; selecting a victim can require several complete sweeps. With `N` occupied slots in a dense array and no concurrent accesses, a victim is found within `max_score * N + 1` inspections.
+
+Deleted or evicted slots become holes without moving other entries. Clearing a slot does not reposition the hand; victim selection advances it as described above. Free indices go onto a stack: deleting slots `1` then `3` produces `[1,3]`; the next insertion pops and fills slot `3`. This allocation does not scan or age entries. Storage grows on demand up to the block capacity, and a full-cache insertion reuses its victim's slot.
+
+Run only Hyper Clock with either backend:
+
+```bash
+kvcache-simulator run \
+  --trace trace.jsonl.gz \
+  --model qwen3-32b \
+  --policies hyper-clock \
+  --hyper-clock-max-score 3
+```
+
+The table includes `HYPER-CLOCK hit`, `HYPER-CLOCK speedup`, and the configured maximum score. JSON results use `hyper-clock`, with the configuration in `metadata.policyParameters["hyper-clock"].maxScore`.
+
+#### Clock examples
+
+Slot and hand indices below are zero-based. `null` means an empty slot. In the first two examples, perform one victim search; in the third, perform only the listed accesses. The test suite reads these examples directly and checks both implementations.
+
+<!-- hyper-clock-victim-examples -->
+```json
+[
+  {"name":"second chances", "max_score":3, "scores":[1,1,0,1], "hand":0, "accesses":[], "victim_slot":2, "scores_after":[0,0,null,1], "hand_after":3},
+  {"name":"wraparound", "max_score":3, "scores":[1,1], "hand":0, "accesses":[], "victim_slot":0, "scores_after":[null,0], "hand_after":1},
+  {"name":"saturating hits", "max_score":3, "scores":[1], "hand":0, "accesses":[0,0,0,0], "scores_after":[3], "hand_after":0}
+]
+```
+
+For `[1,1,0,1]`, slots `0` and `1` lose their scores, slot `2` is evicted, and slot `3` is untouched. For `[1,1]`, the first sweep clears both scores; the search wraps and evicts slot `0`. Repeated hits in the third example never raise the score above `3`.
+
+#### Prefix holes and suffix writes
+
+Hyper Clock reads only the continuous cached prefix and stops at the first miss. It then writes the suffix starting at that miss, in prefix order. A complete hit has no write pass, so each read hit gains only one point. A cached block beyond a hole gets no read refresh or hit credit; it is refreshed only when reached by the suffix writer.
+
+For request `[A,B,C]`, suppose only `A` and `C` are cached, both with score `1`, with one free slot. Each block represents 64 tokens. Reading hits `A`, stops at missing `B`, and returns `(64,1)`: 64 hit tokens and write start at request position `1`. It leaves `C` unchanged. Writing inserts `B` with score `1` and refreshes `C` to `2`. Scores by request position are now `[2,1,2]`. The next read hits all 192 tokens, leaving scores `[3,2,3]`; it returns write start `3`, the exclusive end of the request, so nothing is rewritten.
+
+<!-- hyper-clock-prefix-example -->
+```json
+{"capacity":3, "max_score":3, "block_size":64, "request":["A","B","C"], "cached_positions":[0,2], "hit_tokens":64, "write_start":1, "scores_after_read":[2,null,1], "scores_after_write":[2,1,2], "next_hit_tokens":192, "next_scores":[3,2,3]}
+```
+
+Evicting an ancestor leaves its descendants resident, consuming capacity. They can be evicted only by ordinary victim selection, or become readable again when their preceding prefix is present. Suffix writing checks current membership at each step: earlier writes may have evicted a later suffix block, which must then be inserted with score `1`. Writes may also evict blocks read earlier in the same request. Already counted hits remain valid, and the writer makes one pass without restarting repairs. A request can exceed cache capacity because its blocks are inserted individually. Token weights affect hit accounting; every block still occupies one slot.
+
+For an end-to-end example, use capacity `3`, maximum score `3`, and these four one-token-block requests. The first two requests are warmup. Inserting `X` evicts `A` but leaves `B` and `C`. The third request misses immediately, reconstructs its suffix, and receives zero hits; the fourth hits all three tokens. The measured result is `3 / 6 = 50%` and ideal speedup is `2.0x`.
+
+<!-- hyper-clock-replay-example -->
+```json
+{"capacity":3, "max_score":3, "warmup_fraction":0.5, "requests":[["A","B","C"],["X"],["A","B","C"],["A","B","C"]], "hit_tokens":3, "total_tokens":6, "hit_rate":0.5}
+```
+
+### Measurement for all policies
+
 - Hit rate is measured over the last 50% of requests.
 - Budget points that do not fill the cache before that measurement window are omitted, because they are not under memory pressure yet.
 - Hit tokens count only the longest continuous cached prefix of each request. If a middle block misses, later blocks in that same request do not count as prefill hits even if their ids are already cached.
@@ -126,6 +185,10 @@ Flat LRU appears as `LRU-FLAT hit` and `LRU-FLAT speedup` in the default table a
 ## Performance Notes
 
 The default C++ backend runs all cache-budget points in one batch after loading the trace and building the prefix trie once. This is usually faster than the Python backend, especially on large traces.
+
+After writing the binary trace files, the CLI releases Python's block ID, token weight, and request boundary lists before starting C++. It retains scalar metadata for output. Parsing still holds the full trace in memory before this handoff. Temporary files follow `TMPDIR` (normally `/tmp`); if that directory uses `tmpfs`, the files themselves consume memory.
+
+Python API calls to `run_sweep()` and `run_cpp_sweep()` preserve the input trace by default. With the C++ backend, pass `release_trace_data=True` to release those lists after writing; the consumed trace cannot be reused for another simulation. The Python backend retains its lists for replay.
 
 `--jobs` applies only to the Python backend. It parallelizes independent `(policy, cache budget)` simulation tasks. More jobs are not always faster: the default budget sweep has only a small number of budget points, tasks have uneven runtimes, and large traces can become memory-bandwidth limited.
 

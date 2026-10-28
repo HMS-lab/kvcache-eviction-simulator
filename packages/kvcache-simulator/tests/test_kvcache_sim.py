@@ -415,7 +415,7 @@ int main() {
         self.assertEqual(single["hitTokens"], 2)
         self.assertEqual(all_results["lru-flat"]["hitTokens"], 2)
         self.assertEqual(set(batch["points"][0]), {"cacheBlocks", "lru-flat"})
-        self.assertEqual(set(default_batch["points"][0]), {"cacheBlocks", "fifo", "lru", "lru-flat", "optimal"})
+        self.assertEqual(set(default_batch["points"][0]), {"cacheBlocks", "fifo", "lru", "lru-flat", "hyper-clock", "optimal"})
 
 
 class SweepAndCliTests(unittest.TestCase):
@@ -547,7 +547,10 @@ class SweepAndCliTests(unittest.TestCase):
         self.assertIn("LRU-FLAT hit", table.stdout)
         self.assertIn("LRU-FLAT speedup", table.stdout)
         parsed = json.loads(as_json.stdout)
-        self.assertEqual(parsed["policies"], ["fifo", "lru", "lru-flat", "optimal"])
+        self.assertEqual(parsed["policies"], ["fifo", "lru", "lru-flat", "hyper-clock", "optimal"])
+        self.assertIn("HYPER-CLOCK hit", table.stdout)
+        self.assertIn("HYPER-CLOCK speedup", table.stdout)
+        self.assertIn("Hyper Clock max score: 3", table.stdout)
         self.assertIn("idealPrefillSpeedup", parsed["points"][0]["results"]["lru-flat"])
         selected_result = json.loads(selected.stdout)
         self.assertEqual(selected_result["policies"], ["lru-flat"])

@@ -20,6 +20,7 @@ class TraceData:
     average_input_tokens: float
     parse_errors: int
     skipped_records: int
+    ids_len: int
 
 
 def block_tokens(input_length: int, block_size: int, index: int, count: int) -> int:
@@ -207,6 +208,7 @@ def parse_trace_lines(
         average_input_tokens=total_input_tokens / request_count if request_count else 0.0,
         parse_errors=parse_errors,
         skipped_records=skipped,
+        ids_len=len(ids),
     )
 
 

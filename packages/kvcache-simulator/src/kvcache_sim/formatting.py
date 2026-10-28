@@ -32,6 +32,9 @@ def render_table(result: dict[str, Any]) -> str:
         "Speedup: 1.0x means no-cache prefill throughput where every prefill input token is computed.",
         "",
     ]
+    if "hyper-clock" in policies:
+        max_score = meta.get("policyParameters", {}).get("hyper-clock", {}).get("maxScore", 3)
+        lines.insert(-1, f"Hyper Clock max score: {max_score}")
     headers = ["Budget", "Cache blocks"]
     for policy in policies:
         headers.append(f"{policy.upper()} hit")
