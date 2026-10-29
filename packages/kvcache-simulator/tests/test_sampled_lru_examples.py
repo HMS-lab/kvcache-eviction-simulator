@@ -1,175 +1,186 @@
-"""Worked examples linked from docs/SAMPLED_LRU.md; times below are seconds."""
+"""Execute every documented example against the real C++ implementation.
+
+Only the temporary harness adds sample overrides and observation hooks. Production
+source and algorithms are unchanged; no Python cache implementation is used.
+"""
 from __future__ import annotations
 
-import json
 import shutil
+import subprocess
+import tempfile
 import unittest
-from unittest.mock import patch
+from pathlib import Path
 
-from kvcache_sim.cpp_backend import run_cpp_sweep
-from kvcache_sim.plan import build_execution_plan
-from kvcache_sim.sampled import SampledCache, simulate_sampled
-from kvcache_sim.trace import parse_trace_lines, seconds_us
+SOURCE = Path(__file__).resolve().parents[1] / "src/kvcache_sim/resources/kv-cache-lab-native-sim.cc"
+
+HOOKS = r'''
+struct Snapshot {
+  unsigned node; std::uint64_t time;
+  std::vector<std::pair<unsigned, std::uint64_t>> slots;
+};
+std::vector<std::size_t> forced_sample;
+std::vector<std::uint64_t> eligibility_ages;
+std::vector<std::tuple<unsigned, std::uint64_t, bool>> reads;
+std::vector<Snapshot> writes;
+std::vector<std::pair<unsigned, std::uint64_t>> preload;
+bool writing = false;
+template<class Cache> void record_write(const Cache& cache, unsigned node, std::uint64_t time) {
+  Snapshot s{node, time, {}};
+  for (const auto& slot : cache.slots) s.slots.emplace_back(slot.node, slot.timestamp);
+  writes.push_back(s);
+}
+'''
+
+CASES = r'''
+constexpr std::uint64_t S = 1000000;
+using State = std::vector<std::pair<unsigned, std::uint64_t>>;
+State state(const SampledCache& c) {
+  State s; for (const auto& x : c.slots) s.emplace_back(x.node, x.timestamp); return s;
+}
+Options options(unsigned sample) { Options o; o.sampled_size = sample; o.sampled_threshold = 10*S; return o; }
+SimulationInput input(std::vector<unsigned> ids, std::vector<unsigned> ends,
+                      std::vector<std::uint64_t> arrivals, std::vector<std::uint64_t> finishes) {
+  SimulationInput i; i.ids = ids; i.tokens.assign(ids.size(), 64); i.request_ends = ends;
+  i.arrivals = arrivals; i.completions = finishes; i.timing_available = true;
+  for (unsigned n = 0; n < ends.size(); ++n) i.completion_order.push_back(n);
+  i.prefix = build_prefix_plan(i.ids, i.request_ends);
+  return i;
+}
+void batch() {
+  auto o = options(3); SampledCache c(4,o);
+  c.write(1,0); c.write(2,4*S); c.write(3,10*S); c.write(4,18*S);
+  forced_sample = {0,1,2}; c.write(5,20*S);
+  assert((state(c) == State{{0,0},{5,20*S},{3,10*S},{4,18*S}}));
+  assert((c.free == std::vector<std::size_t>{0}));
+  // If another sample is taken, this sentinel would be consumed by the hook.
+  forced_sample = {0}; c.write(6,21*S);
+  assert((forced_sample == std::vector<std::size_t>{0}));
+  assert((state(c) == State{{6,21*S},{5,20*S},{3,10*S},{4,18*S}}));
+  assert(c.free.empty());
+}
+void fallback() {
+  auto o = options(1); SampledCache c(3,o);
+  c.write(1,0); c.write(2,15*S); c.write(3,19*S);
+  forced_sample = {2}; eligibility_ages.clear(); c.write(4,20*S);
+  assert((state(c) == State{{4,20*S},{2,15*S},{3,19*S}}));
+  assert((eligibility_ages == std::vector<std::uint64_t>{10*S,10*S}));
+  assert(c.threshold == 10*S);
+}
+void halving() {
+  auto o = options(2); SampledCache c(2,o); c.write(1,8*S); c.write(2,8*S);
+  eligibility_ages.clear(); c.write(3,10*S);
+  assert((eligibility_ages == std::vector<std::uint64_t>{10*S,10*S,10*S,10*S,5*S,5*S,2500000,2500000,1250000}));
+  assert((state(c) == State{{3,10*S},{2,8*S}}));
+  eligibility_ages.clear(); c.write(4,10*S);
+  assert((eligibility_ages == std::vector<std::uint64_t>{10*S,10*S,10*S,10*S,5*S,5*S,2500000,2500000,1250000,1250000}));
+  assert((state(c) == State{{3,10*S},{4,10*S}}));
+  eligibility_ages.clear(); c.write(5,10*S);
+  assert(eligibility_ages.back() == 0);
+  assert((state(c) == State{{5,10*S},{4,10*S}}));
+  assert(c.threshold == 10*S);
+}
+void prefix() {
+  auto i = input({1,2,3,1,2,3}, {3,6}, {10*S,13*S}, {12*S,14*S});
+  const auto a=i.prefix.node_for_event[0], b=i.prefix.node_for_event[1], c=i.prefix.node_for_event[2];
+  preload = {{a,0},{c,0}};
+  auto o=options(3); o.warmup_requests=1;
+  auto r=simulate_sampled(i,3,o);
+  assert((reads == std::vector<std::tuple<unsigned,std::uint64_t,bool>>{
+    {a,10*S,true},{b,10*S,false},{a,13*S,true},{b,13*S,true},{c,13*S,true}}));
+  assert(writes.size()==6);
+  assert((writes[0].slots == State{{a,12*S},{c,0}})); // C was not read/refreshed beyond B's hole.
+  assert(writes[0].node==a && writes[1].node==b && writes[2].node==c);
+  assert((writes[2].slots == State{{a,12*S},{c,12*S},{b,12*S}}));
+  assert(writes[3].node==a && writes[4].node==b && writes[5].node==c);
+  assert((writes[5].slots == State{{a,14*S},{c,14*S},{b,14*S}}));
+  assert(r.hit_tokens==192 && r.total_tokens==192 && r.hit_rate()==1.0);
+  auto branches=build_prefix_plan({1,2,3,4,2,3},{3,6});
+  assert(branches.node_for_event[1]!=branches.node_for_event[4]);
+  assert(branches.node_for_event[2]!=branches.node_for_event[5]);
+}
+void clock_example() {
+  auto i=input({1,2,2,2},{1,2,3,4},{0,0,2*S,5*S},{S,5*S,6*S,7*S});
+  auto o=options(1); o.warmup_requests=2;
+  auto r=simulate_sampled(i,1,o);
+  assert((reads == std::vector<std::tuple<unsigned,std::uint64_t,bool>>{
+    {1,0,false},{2,0,false},{2,2*S,false},{2,5*S,true}}));
+  assert(writes.size()==4);
+  assert(writes[0].node==1 && writes[0].time==S);
+  assert(writes[1].node==2 && writes[1].time==5*S);
+  assert(writes[2].node==2 && writes[2].time==6*S);
+  assert(writes[3].node==2 && writes[3].time==7*S);
+  assert((writes[3].slots==State{{2,7*S}}));
+  assert(r.hit_tokens==64 && r.total_tokens==128 && r.hit_rate()==0.5);
+}
+int main(int argc,char** argv) {
+  assert(argc==2); std::string name=argv[1];
+  if(name=="batch") batch(); else if(name=="fallback") fallback();
+  else if(name=="halving") halving(); else if(name=="prefix") prefix();
+  else if(name=="clock") clock_example(); else assert(false);
+}
+'''
 
 
-def make_cache(capacity, sample_size):
-    return SampledCache(capacity, seconds_us(10), sample_size, seed=0)
+@unittest.skipUnless(shutil.which("c++"), "C++ compiler required for native examples")
+class NativeDocumentedExamplesTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory(prefix="sampled-native-examples-")
+        cls.addClassCleanup(cls.directory.cleanup)
+        source = SOURCE.read_text()
+        # Hooks observe the actual implementation; they do not replace policy logic.
+        anchor = "struct SampledSlot {"
+        source = source.replace(anchor, HOOKS + "\n" + anchor, 1)
+        source = source.replace("rng(o.sampled_seed) {}", """rng(o.sampled_seed) {
+          for (auto item : preload) write(item.first,item.second);
+          preload.clear(); reads.clear(); writes.clear();
+        }""", 1)
+        begin = source.index("struct SampledCache {")
+        end = source.index("Result simulate_sampled(", begin)
+        cache = source[begin:end]
+        cache = cache.replace("if (it == entries.end()) return false;", """if (it == entries.end()) {
+          if (!writing) reads.emplace_back(node,now,false); return false;
+        }
+        if (!writing) reads.emplace_back(node,now,true);""", 1)
+        cache = cache.replace("return slot.node != 0 &&", "eligibility_ages.push_back(age);\n    return slot.node != 0 &&", 1)
+        cache = cache.replace("rng);", """rng);
+    if (!forced_sample.empty()) {
+      sample.clear(); for (auto index : forced_sample) sample.push_back(slots.at(index));
+      forced_sample.clear();
+    }""", 1)
+        cache = cache.replace("void write(std::uint32_t node, std::uint64_t now) {", """void write(std::uint32_t node, std::uint64_t now) {
+    struct Capture {
+      SampledCache& cache; unsigned node; std::uint64_t now;
+      ~Capture() { record_write(cache,node,now); writing=false; }
+    } capture{*this,node,now};
+    writing=true;""", 1)
+        source = source[:begin] + cache + source[end:]
+        cpp = Path(cls.directory.name) / "examples.cc"
+        cls.binary = Path(cls.directory.name) / "examples"
+        cpp.write_text("#include <cassert>\n#include <utility>\n#define main simulator_main\n" + source + "\n#undef main\n" + CASES)
+        compiled = subprocess.run(["c++", "-std=c++17", "-O0", str(cpp), "-o", str(cls.binary)],
+                                  capture_output=True, text=True)
+        if compiled.returncode:
+            raise AssertionError(compiled.stderr)
 
+    def run_example(self, name):
+        result = subprocess.run([str(self.binary), name], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
-def slot_state(cache):
-    return [None if slot is None else (slot.node, slot.timestamp) for slot in cache.slots]
-
-
-def make_trace(requests):
-    return parse_trace_lines([
-        json.dumps(dict(timestamp=start, completion_timestamp=finish,
-                        conversation_id=str(index), block_size=64,
-                        hash_ids=blocks, input_length=len(blocks) * 64))
-        for index, (start, finish, blocks) in enumerate(requests)
-    ], timing_mode="required")
-
-
-class DocumentedExamplesTests(unittest.TestCase):
     def test_batch_eviction_and_free_slot_reuse(self):
-        # A=1, B=2, C=3, D=4, E=5, F=6; slots are zero-based.
-        cache = make_cache(capacity=4, sample_size=3)
-        for node, time in [(1, 0), (2, 4), (3, 10), (4, 18)]:
-            cache.write(node, seconds_us(time))
-        self.assertEqual([(seconds_us(20) - slot.timestamp) // 1_000_000 for slot in cache.slots],
-                         [20, 16, 10, 2])
-        with patch.object(cache.rng, "sample", return_value=[0, 1, 2]) as sample:
-            cache.write(5, seconds_us(20))
-            sample.assert_called_once_with(range(4), 3)
-        # C's age is exactly ten seconds, so the strict threshold protects it.
-        self.assertEqual(slot_state(cache), [None, (5, seconds_us(20)),
-                                             (3, seconds_us(10)), (4, seconds_us(18))])
-        self.assertEqual(cache.free, [0])
-        with patch.object(cache.rng, "sample", side_effect=AssertionError("free slot available")):
-            cache.write(6, seconds_us(21))
-        self.assertEqual(slot_state(cache), [(6, seconds_us(21)), (5, seconds_us(20)),
-                                             (3, seconds_us(10)), (4, seconds_us(18))])
-        self.assertEqual(cache.free, [])
+        self.run_example("batch")
 
     def test_sample_miss_falls_back_to_first_eligible_slot(self):
-        # A=1, B=2, C=3, D=4. Sampling C cannot find the eligible A.
-        cache = make_cache(capacity=3, sample_size=1)
-        for node, time in [(1, 0), (2, 15), (3, 19)]:
-            cache.write(node, seconds_us(time))
-        with patch.object(cache.rng, "sample", return_value=[2]) as sample, \
-                patch.object(cache, "discard", wraps=cache.discard) as discard:
-            cache.write(4, seconds_us(20))
-            sample.assert_called_once_with(range(3), 1)
-            discard.assert_called_once_with(0)
-        self.assertEqual(slot_state(cache), [(4, seconds_us(20)), (2, seconds_us(15)),
-                                             (3, seconds_us(19))])
-        self.assertEqual(cache.threshold, seconds_us(10))
+        self.run_example("fallback")
 
     def test_threshold_halving_resets_and_reaches_zero(self):
-        # Count fallback passes to verify the documented 10 -> 5 -> 2.5 -> 1.25.
-        class ScannedSlots(list):
-            scans = 0
-
-            def __iter__(self):
-                self.scans += 1
-                return super().__iter__()
-
-        cache = make_cache(capacity=2, sample_size=2)
-        cache.write(1, seconds_us(8))
-        cache.write(2, seconds_us(8))
-        cache.slots = ScannedSlots(cache.slots)
-        cache.write(3, seconds_us(10))
-        self.assertEqual(cache.slots.scans, 4)
-        self.assertEqual(slot_state(cache), [(3, seconds_us(10)), (2, seconds_us(8))])
-        # Start the next operation at ten again; one scan at 1.25 would be wrong.
-        cache.slots.scans = 0
-        cache.write(4, seconds_us(10))
-        self.assertEqual(cache.slots.scans, 4)
-        self.assertEqual(slot_state(cache), [(3, seconds_us(10)), (4, seconds_us(10))])
-        cache.write(5, seconds_us(10))
-        self.assertEqual(slot_state(cache), [(5, seconds_us(10)), (4, seconds_us(10))])
-        self.assertEqual(cache.threshold, seconds_us(10))
+        self.run_example("halving")
 
     def test_prefix_hole_and_completion_refresh(self):
-        data = make_trace([(10, 12, ["A", "B", "C"]), (13, 14, ["A", "B", "C"])])
-        plan = build_execution_plan(data)
-        a, b, c = plan.node_for_event[:3]
-        cache = make_cache(capacity=3, sample_size=3)
-        cache.write(a, 0)
-        cache.write(c, 0)
-        reads, writes = [], []
-        lookup, write = cache.lookup, cache.write
-
-        def observe_lookup(node, now):
-            hit = lookup(node, now)
-            if now in (seconds_us(10), seconds_us(13)):
-                reads.append((node, now, hit, slot_state(cache)))
-            return hit
-
-        def observe_write(node, now):
-            write(node, now)
-            writes.append((node, now, slot_state(cache)))
-
-        with patch("kvcache_sim.sampled.SampledCache", return_value=cache), \
-                patch.object(cache, "lookup", side_effect=observe_lookup), \
-                patch.object(cache, "write", side_effect=observe_write):
-            result = simulate_sampled(plan, 3)
-        self.assertEqual([(n, hit) for n, t, hit, _ in reads if t == seconds_us(10)],
-                         [(a, True), (b, False)])
-        self.assertEqual(reads[1][3], [(a, seconds_us(10)), (c, 0)])
-        self.assertEqual([(n, t) for n, t, _ in writes],
-                         [(n, seconds_us(t)) for t in (12, 14) for n in (a, b, c)])
-        self.assertEqual(writes[2][2], [(a, seconds_us(12)), (c, seconds_us(12)),
-                                        (b, seconds_us(12))])
-        self.assertEqual([hit for _, t, hit, _ in reads if t == seconds_us(13)], [True]*3)
-        self.assertEqual(writes[-1][2], [(a, seconds_us(14)), (c, seconds_us(14)),
-                                        (b, seconds_us(14))])
-        self.assertEqual((result.hitTokens, result.totalTokens), (192, 192))
-        # The first request is warmup, so its 64-token prefix hit is unmeasured.
-        self.assertEqual(sum(hit for _, t, hit, _ in reads if t == seconds_us(10)) * 64, 64)
-        branches = build_execution_plan(make_trace([
-            (0, 1, ["A", "B", "C"]), (2, 3, ["X", "B", "C"]),
-        ]))
-        self.assertNotEqual(branches.node_for_event[1], branches.node_for_event[4])
-        self.assertNotEqual(branches.node_for_event[2], branches.node_for_event[5])
+        self.run_example("prefix")
 
     def test_clock_overlap_and_completion_before_arrival(self):
-        data = make_trace([
-            (0, 1, ["W"]), (0, 5, ["A"]), (2, 6, ["A"]), (5, 7, ["A"]),
-        ])
-        plan = build_execution_plan(data)
-        w, a = plan.node_for_event[:2]
-        cache = make_cache(capacity=1, sample_size=1)
-        reads, writes = [], []
-        lookup, write = cache.lookup, cache.write
-        writing = False
-
-        def observe_lookup(node, now):
-            hit = lookup(node, now)
-            if not writing:
-                reads.append((node, now, hit))
-            return hit
-
-        def observe_write(node, now):
-            nonlocal writing
-            writing = True
-            write(node, now)
-            writing = False
-            writes.append((node, now))
-
-        with patch("kvcache_sim.sampled.SampledCache", return_value=cache), \
-                patch.object(cache, "lookup", side_effect=observe_lookup), \
-                patch.object(cache, "write", side_effect=observe_write):
-            result = simulate_sampled(plan, 1, sample_size=1)
-        self.assertEqual(reads, [(w, 0, False), (a, 0, False),
-                                 (a, seconds_us(2), False), (a, seconds_us(5), True)])
-        self.assertEqual(writes, [(w, seconds_us(1)), (a, seconds_us(5)),
-                                  (a, seconds_us(6)), (a, seconds_us(7))])
-        self.assertEqual(slot_state(cache), [(a, seconds_us(7))])
-        self.assertEqual((result.hitTokens, result.totalTokens, result.hitRate), (64, 128, 0.5))
-        if shutil.which("c++"):
-            native = run_cpp_sweep(data, capacities=[1], policies=["sampled-lru"], warmup_requests=2,
-                                   sampled_lru_sample_size=1)
-            self.assertEqual(native.results["sampled-lru", 1], result)
+        self.run_example("clock")
 
 
 if __name__ == "__main__":
