@@ -271,7 +271,7 @@ struct ScheduledEvent {
 
 class RequestScheduler {
  public:
-  virtual ~RequestScheduler() { instance_ = nullptr; }
+  virtual ~RequestScheduler() { if (instance_ == this) instance_ = nullptr; }
   RequestScheduler(const RequestScheduler&) = delete;
   RequestScheduler& operator=(const RequestScheduler&) = delete;
 
@@ -279,6 +279,11 @@ class RequestScheduler {
     assert(instance_);
     assert(instance_->at_start());
     return *instance_;
+  }
+  static void activate(RequestScheduler& scheduler) {
+    assert(!instance_ || instance_->at_start());
+    assert(scheduler.at_start());
+    instance_ = &scheduler;
   }
   virtual std::optional<ScheduledEvent> next_event() = 0;
   virtual bool exhausted() const = 0;
@@ -290,15 +295,41 @@ class RequestScheduler {
   }
 
  protected:
-  RequestScheduler() {
-    assert(!instance_);
-    instance_ = this;
+  explicit RequestScheduler(bool register_instance = true) {
+    if (register_instance) {
+      assert(!instance_);
+      instance_ = this;
+    }
   }
   virtual bool at_start() const = 0;
   virtual void reset_impl() = 0;
 
  private:
   inline static RequestScheduler* instance_ = nullptr;
+};
+
+// Generate adjacent read/write events without storing a timeline. Timestamps are unused.
+class SequentialRequestScheduler final : public RequestScheduler {
+ public:
+  explicit SequentialRequestScheduler(std::uint32_t request_count, bool register_instance = true)
+      : RequestScheduler(register_instance), event_count_(2ULL * request_count) {}
+
+  std::optional<ScheduledEvent> next_event() override {
+    if (exhausted()) return std::nullopt;
+    const auto event = cursor_++;
+    return ScheduledEvent{static_cast<std::uint32_t>(event / 2),
+      event % 2 ? ScheduledEventKind::Completion : ScheduledEventKind::Arrival, 0};
+  }
+  bool exhausted() const override { return cursor_ == event_count_; }
+  void discard_remaining() override { cursor_ = event_count_; }
+
+ protected:
+  bool at_start() const override { return cursor_ == 0; }
+  void reset_impl() override { cursor_ = 0; }
+
+ private:
+  const std::uint64_t event_count_;
+  std::uint64_t cursor_ = 0;
 };
 
 class RecordedTimeScheduler final : public RequestScheduler {
@@ -480,26 +511,31 @@ Result underfilled_result(const SimulationInput& input, const Options& options) 
 Result simulate_ceiling(const SimulationInput& input, const Options& options) {
   Result result;
   std::vector<std::uint8_t> seen(input.prefix.parent.size(), 0);
-  std::uint64_t start = 0;
-  for (std::uint64_t request = 0; request < input.request_ends.size(); request += 1) {
+  auto& scheduler = RequestScheduler::get();
+  while (const auto event = scheduler.next_event()) {
+    const auto request = event->request;
+    const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
     const std::uint64_t end = input.request_ends[request];
-    const bool measured = request >= options.warmup_requests;
-    bool prefix_alive = true;
-    for (std::uint64_t index = start; index < end; index += 1) {
-      const std::uint32_t node = input.prefix.node_for_event[index];
-      const bool hit = seen[node] != 0;
-      if (measured) result.total_tokens += input.tokens[index];
-      if (measured && prefix_alive && hit) {
-        result.hit_tokens += input.tokens[index];
-      } else if (!hit) {
-        prefix_alive = false;
+    if (event->kind == ScheduledEventKind::Arrival) {
+      const bool measured = request >= options.warmup_requests;
+      bool prefix_alive = true;
+      for (std::uint64_t index = start; index < end; index += 1) {
+        const std::uint32_t node = input.prefix.node_for_event[index];
+        const bool hit = seen[node] != 0;
+        if (measured) result.total_tokens += input.tokens[index];
+        if (measured && prefix_alive && hit) {
+          result.hit_tokens += input.tokens[index];
+        } else if (!hit) {
+          prefix_alive = false;
+        }
+      }
+    } else {
+      for (std::uint64_t index = start; index < end; index += 1) {
+        seen[input.prefix.node_for_event[index]] = 1;
       }
     }
-    for (std::uint64_t index = start; index < end; index += 1) {
-      seen[input.prefix.node_for_event[index]] = 1;
-    }
-    start = end;
   }
+  scheduler.reset();
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
 }
@@ -514,47 +550,56 @@ Result simulate_fifo(const SimulationInput& input, std::uint32_t capacity, const
   std::uint32_t cache_size = 0;
   bool full_before_measurement = false;
 
-  std::uint64_t start = 0;
-  for (std::uint64_t request = 0; request < input.request_ends.size(); request += 1) {
-    if (request >= options.warmup_requests && !full_before_measurement) return underfilled_result(input, options);
+  auto& scheduler = RequestScheduler::get();
+  while (const auto event = scheduler.next_event()) {
+    const auto request = event->request;
+    const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
     const std::uint64_t end = input.request_ends[request];
-    const bool measured = request >= options.warmup_requests;
-    bool prefix_alive = true;
-    for (std::uint64_t index = start; index < end; index += 1) {
-      const std::uint32_t id = input.prefix.node_for_event[index];
-      const bool hit = in_cache[id] != 0;
-      if (measured) {
-        result.total_tokens += input.tokens[index];
-        if (prefix_alive && hit) result.hit_tokens += input.tokens[index];
+    if (event->kind == ScheduledEventKind::Arrival) {
+      if (request >= options.warmup_requests && !full_before_measurement) {
+        scheduler.discard_remaining();
+        scheduler.reset();
+        return underfilled_result(input, options);
       }
-      if (!hit) prefix_alive = false;
-    }
-    for (std::uint64_t index = start; index < end; index += 1) {
-      const std::uint32_t id = input.prefix.node_for_event[index];
-      if (in_cache[id]) continue;
-      if (cache_size >= capacity) {
-        while (head < queue.size()) {
-          const std::uint32_t victim = queue[head++];
-          if (in_cache[victim]) {
-            in_cache[victim] = 0;
-            cache_size -= 1;
-            break;
+      const bool measured = request >= options.warmup_requests;
+      bool prefix_alive = true;
+      for (std::uint64_t index = start; index < end; index += 1) {
+        const std::uint32_t id = input.prefix.node_for_event[index];
+        const bool hit = in_cache[id] != 0;
+        if (measured) {
+          result.total_tokens += input.tokens[index];
+          if (prefix_alive && hit) result.hit_tokens += input.tokens[index];
+        }
+        if (!hit) prefix_alive = false;
+      }
+    } else {
+      for (std::uint64_t index = start; index < end; index += 1) {
+        const std::uint32_t id = input.prefix.node_for_event[index];
+        if (in_cache[id]) continue;
+        if (cache_size >= capacity) {
+          while (head < queue.size()) {
+            const std::uint32_t victim = queue[head++];
+            if (in_cache[victim]) {
+              in_cache[victim] = 0;
+              cache_size -= 1;
+              break;
+            }
           }
         }
-      }
-      if (cache_size < capacity) {
-        in_cache[id] = 1;
-        cache_size += 1;
-        queue.push_back(id);
-        if (cache_size >= capacity && request < options.warmup_requests) full_before_measurement = true;
-      }
-      if (head > 1'000'000 && head * 2 > queue.size()) {
-        queue.erase(queue.begin(), queue.begin() + static_cast<std::ptrdiff_t>(head));
-        head = 0;
+        if (cache_size < capacity) {
+          in_cache[id] = 1;
+          cache_size += 1;
+          queue.push_back(id);
+          if (cache_size >= capacity && request < options.warmup_requests) full_before_measurement = true;
+        }
+        if (head > 1'000'000 && head * 2 > queue.size()) {
+          queue.erase(queue.begin(), queue.begin() + static_cast<std::ptrdiff_t>(head));
+          head = 0;
+        }
       }
     }
-    start = end;
   }
+  scheduler.reset();
   if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
@@ -618,19 +663,28 @@ Result simulate_flat_lru(const SimulationInput& input, std::uint32_t capacity, c
   Result result;
   FlatLruCache cache(capacity);
   bool full_before_measurement = false;
-  std::uint64_t start = 0;
-  for (std::uint64_t request = 0; request < input.request_ends.size(); request += 1) {
-    if (request >= options.warmup_requests && !full_before_measurement) return underfilled_result(input, options);
+  auto& scheduler = RequestScheduler::get();
+  while (const auto event = scheduler.next_event()) {
+    const auto request = event->request;
+    const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
     const std::uint64_t end = input.request_ends[request];
-    const std::uint64_t request_hits = read_flat_lru_prefix(cache, input, start, end);
-    if (request >= options.warmup_requests) {
-      result.hit_tokens += request_hits;
-      for (std::uint64_t index = start; index < end; index += 1) result.total_tokens += input.tokens[index];
+    if (event->kind == ScheduledEventKind::Arrival) {
+      if (request >= options.warmup_requests && !full_before_measurement) {
+        scheduler.discard_remaining();
+        scheduler.reset();
+        return underfilled_result(input, options);
+      }
+      const std::uint64_t request_hits = read_flat_lru_prefix(cache, input, start, end);
+      if (request >= options.warmup_requests) {
+        result.hit_tokens += request_hits;
+        for (std::uint64_t index = start; index < end; index += 1) result.total_tokens += input.tokens[index];
+      }
+    } else {
+      write_flat_lru_request(cache, input, start, end);
+      if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
     }
-    write_flat_lru_request(cache, input, start, end);
-    if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
-    start = end;
   }
+  scheduler.reset();
   if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
@@ -733,19 +787,30 @@ Result simulate_hyper_clock(const SimulationInput& input, std::uint32_t capacity
   Result result;
   HyperClockCache cache(capacity, options.hyper_clock_max_score);
   bool full_before_measurement = false;
-  std::uint64_t start = 0;
-  for (std::uint64_t request = 0; request < input.request_ends.size(); ++request) {
-    if (request >= options.warmup_requests && !full_before_measurement) return underfilled_result(input, options);
-    const auto end = input.request_ends[request];
-    const auto read = read_hyper_clock_prefix(cache, input, start, end);
-    if (request >= options.warmup_requests) {
-      result.hit_tokens += read.hit_tokens;
-      for (auto index = start; index < end; ++index) result.total_tokens += input.tokens[index];
+  auto& scheduler = RequestScheduler::get();
+  std::uint64_t write_start = 0;
+  while (const auto event = scheduler.next_event()) {
+    const auto request = event->request;
+    const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
+    const std::uint64_t end = input.request_ends[request];
+    if (event->kind == ScheduledEventKind::Arrival) {
+      if (request >= options.warmup_requests && !full_before_measurement) {
+        scheduler.discard_remaining();
+        scheduler.reset();
+        return underfilled_result(input, options);
+      }
+      const auto read = read_hyper_clock_prefix(cache, input, start, end);
+      if (request >= options.warmup_requests) {
+        result.hit_tokens += read.hit_tokens;
+        for (auto index = start; index < end; ++index) result.total_tokens += input.tokens[index];
+      }
+      write_start = read.write_start;
+    } else {
+      write_hyper_clock_suffix(cache, input, write_start, end);
+      if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
     }
-    write_hyper_clock_suffix(cache, input, read.write_start, end);
-    if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
-    start = end;
   }
+  scheduler.reset();
   if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
@@ -892,44 +957,52 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
     }
   };
 
-  std::uint64_t start = 0;
-  for (std::uint64_t request = 0; request < input.request_ends.size(); request += 1) {
-    if (request >= options.warmup_requests && !full_before_measurement) return underfilled_result(input, options);
+  auto& scheduler = RequestScheduler::get();
+  while (const auto event = scheduler.next_event()) {
+    const auto request = event->request;
+    const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
     const std::uint64_t end = input.request_ends[request];
-    const bool measured = request >= options.warmup_requests;
-    bool prefix_alive = true;
-    for (std::uint64_t index = start; index < end; index += 1) {
-      const std::uint32_t node = input.prefix.node_for_event[index];
-      const bool hit = present[node] != 0;
-      if (measured) {
-        result.total_tokens += input.tokens[index];
-        if (prefix_alive && hit) result.hit_tokens += input.tokens[index];
+    if (event->kind == ScheduledEventKind::Arrival) {
+      if (request >= options.warmup_requests && !full_before_measurement) {
+        scheduler.discard_remaining();
+        scheduler.reset();
+        return underfilled_result(input, options);
       }
-      if (prefix_alive && hit) {
-        if (optimal) update_optimal(node, input.prefix.next_request_for_event[index]);
-        else touch_lru(node);
-      } else if (!hit) {
-        prefix_alive = false;
+      const bool measured = request >= options.warmup_requests;
+      bool prefix_alive = true;
+      for (std::uint64_t index = start; index < end; index += 1) {
+        const std::uint32_t node = input.prefix.node_for_event[index];
+        const bool hit = present[node] != 0;
+        if (measured) {
+          result.total_tokens += input.tokens[index];
+          if (prefix_alive && hit) result.hit_tokens += input.tokens[index];
+        }
+        if (prefix_alive && hit) {
+          if (optimal) update_optimal(node, input.prefix.next_request_for_event[index]);
+          else touch_lru(node);
+        } else if (!hit) {
+          prefix_alive = false;
+        }
+      }
+    } else {
+      mark_protected_path(start, end);
+      for (std::uint64_t index = start; index < end; index += 1) {
+        const std::uint32_t node = input.prefix.node_for_event[index];
+        if (present[node]) continue;
+        if (cache_size >= capacity) {
+          const std::uint32_t candidate_key = optimal ? input.prefix.next_request_for_event[index] : 0;
+          if (!evict_leaf(candidate_key)) break;
+        }
+        if (cache_size < capacity && present[input.prefix.parent[node]]) {
+          add_node(node, index);
+          if (cache_size >= capacity && request < options.warmup_requests) full_before_measurement = true;
+        } else {
+          break;
+        }
       }
     }
-
-    mark_protected_path(start, end);
-    for (std::uint64_t index = start; index < end; index += 1) {
-      const std::uint32_t node = input.prefix.node_for_event[index];
-      if (present[node]) continue;
-      if (cache_size >= capacity) {
-        const std::uint32_t candidate_key = optimal ? input.prefix.next_request_for_event[index] : 0;
-        if (!evict_leaf(candidate_key)) break;
-      }
-      if (cache_size < capacity && present[input.prefix.parent[node]]) {
-        add_node(node, index);
-        if (cache_size >= capacity && request < options.warmup_requests) full_before_measurement = true;
-      } else {
-        break;
-      }
-    }
-    start = end;
   }
+  scheduler.reset();
   if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
@@ -1036,17 +1109,6 @@ struct AllResults {
   Result sampled;
 };
 
-AllResults simulate_all(const SimulationInput& input, std::uint32_t capacity, const Options& options) {
-  return {
-    simulate_fifo(input, capacity, options),
-    simulate_trie_policy(input, capacity, false, options),
-    simulate_flat_lru(input, capacity, options),
-    simulate_hyper_clock(input, capacity, options),
-    simulate_trie_policy(input, capacity, true, options),
-    input.timing_available ? simulate_sampled(input, capacity, options) : Result{},
-  };
-}
-
 bool has_policy(const Options& options, const std::string& policy) {
   if (options.policies.empty()) return true;
   return std::find(options.policies.begin(), options.policies.end(), policy) != options.policies.end();
@@ -1104,80 +1166,119 @@ void print_all_results(std::uint64_t cache_blocks, const AllResults& results, st
   std::cout << "}\n";
 }
 
-void print_batch_results(const SimulationInput& input, const Options& options) {
-  const std::uint64_t trie_node_count = input.prefix.parent.size();
-  const std::uint64_t total_steps = 1 + options.capacities.size();
-  std::uint64_t completed_steps = 0;
-
-  const Result ceiling = simulate_ceiling(input, options);
-  completed_steps += 1;
-  report_progress(options, completed_steps, total_steps, "ceiling");
-
-  std::cout << "{"
-            << "\"trieNodeCount\":" << trie_node_count << ","
-            << "\"uniqueBlocks\":" << input.unique_blocks << ","
-            << "\"warmupRequests\":" << options.warmup_requests << ","
-            << "\"ceiling\":{";
-  print_named_result("ceiling", input.unique_blocks, ceiling, options.warmup_requests);
-  std::cout << "},\"points\":[";
-
-  bool first_point = true;
-  for (std::uint32_t capacity : options.capacities) {
-    Result fifo;
-    Result lru;
-    Result flat_lru;
-    Result hyper_clock;
-    Result optimal;
-    Result sampled;
-    const bool run_sampled = has_policy(options, "sampled-lru") && input.timing_available;
-    if (run_sampled) sampled = simulate_sampled(input, capacity, options);
-    if (has_policy(options, "fifo")) fifo = simulate_fifo(input, capacity, options);
-    if (has_policy(options, "lru")) lru = simulate_trie_policy(input, capacity, false, options);
-    if (has_policy(options, "lru-flat")) flat_lru = simulate_flat_lru(input, capacity, options);
-    if (has_policy(options, "hyper-clock")) hyper_clock = simulate_hyper_clock(input, capacity, options);
-    if (has_policy(options, "optimal")) optimal = simulate_trie_policy(input, capacity, true, options);
-
-    if (!first_point) std::cout << ",";
-    first_point = false;
-    std::cout << "{"
-              << "\"cacheBlocks\":" << capacity;
-    if (has_policy(options, "fifo")) {
-      std::cout << ",\"fifo\":{";
-      print_named_result("fifo", capacity, fifo, options.warmup_requests);
-      std::cout << "}";
-    }
-    if (has_policy(options, "lru")) {
-      std::cout << ",\"lru\":{";
-      print_named_result("lru", capacity, lru, options.warmup_requests);
-      std::cout << "}";
-    }
-    if (has_policy(options, "lru-flat")) {
-      std::cout << ",\"lru-flat\":{";
-      print_named_result("lru-flat", capacity, flat_lru, options.warmup_requests);
-      std::cout << "}";
-    }
-    if (has_policy(options, "hyper-clock")) {
-      std::cout << ",\"hyper-clock\":{";
-      print_named_result("hyper-clock", capacity, hyper_clock, options.warmup_requests);
-      std::cout << "}";
-    }
-    if (has_policy(options, "optimal")) {
-      std::cout << ",\"optimal\":{";
-      print_named_result("optimal", capacity, optimal, options.warmup_requests);
-      std::cout << "}";
-    }
-    if (run_sampled) {
-      std::cout << ",\"sampled-lru\":{";
-      print_named_result("sampled-lru", capacity, sampled, options.warmup_requests);
-      std::cout << "}";
-    }
-    std::cout << "}";
-
-    completed_steps += 1;
-    report_progress(options, completed_steps, total_steps, "capacity");
+// The owner fixes each policy's scheduler; policies only consume the active interface.
+class SimulationRunner {
+ public:
+  SimulationRunner(const SimulationInput& input, const Options& options, bool run_sampled)
+      : input(input), options(options), sequential(input.request_ends.size(), false) {
+    if (run_sampled) recorded.emplace(input.arrivals, input.completions, input.completion_order);
   }
-  std::cout << "]}\n";
-}
+
+  Result run(const std::string& policy, std::uint32_t capacity) {
+    if (policy == "sampled-lru") {
+      assert(recorded);
+      RequestScheduler::activate(*recorded);
+      return simulate_sampled(input, capacity, options);
+    }
+    RequestScheduler::activate(sequential);
+    if (policy == "ceiling") return simulate_ceiling(input, options);
+    if (policy == "fifo") return simulate_fifo(input, capacity, options);
+    if (policy == "lru") return simulate_trie_policy(input, capacity, false, options);
+    if (policy == "lru-flat") return simulate_flat_lru(input, capacity, options);
+    if (policy == "hyper-clock") return simulate_hyper_clock(input, capacity, options);
+    if (policy == "optimal") return simulate_trie_policy(input, capacity, true, options);
+    throw std::runtime_error("Unsupported policy: " + policy);
+  }
+
+  AllResults simulate_all(std::uint32_t capacity) {
+    return {
+      run("fifo", capacity), run("lru", capacity), run("lru-flat", capacity),
+      run("hyper-clock", capacity), run("optimal", capacity),
+      input.timing_available ? run("sampled-lru", capacity) : Result{},
+    };
+  }
+
+  void print_batch_results() {
+    const std::uint64_t trie_node_count = input.prefix.parent.size();
+    const std::uint64_t total_steps = 1 + options.capacities.size();
+    std::uint64_t completed_steps = 0;
+
+    const Result ceiling = run("ceiling", 0);
+    completed_steps += 1;
+    report_progress(options, completed_steps, total_steps, "ceiling");
+
+    std::cout << "{"
+              << "\"trieNodeCount\":" << trie_node_count << ","
+              << "\"uniqueBlocks\":" << input.unique_blocks << ","
+              << "\"warmupRequests\":" << options.warmup_requests << ","
+              << "\"ceiling\":{";
+    print_named_result("ceiling", input.unique_blocks, ceiling, options.warmup_requests);
+    std::cout << "},\"points\":[";
+
+    bool first_point = true;
+    for (std::uint32_t capacity : options.capacities) {
+      Result fifo;
+      Result lru;
+      Result flat_lru;
+      Result hyper_clock;
+      Result optimal;
+      Result sampled;
+      const bool run_sampled = has_policy(options, "sampled-lru") && input.timing_available;
+      if (run_sampled) sampled = run("sampled-lru", capacity);
+      if (has_policy(options, "fifo")) fifo = run("fifo", capacity);
+      if (has_policy(options, "lru")) lru = run("lru", capacity);
+      if (has_policy(options, "lru-flat")) flat_lru = run("lru-flat", capacity);
+      if (has_policy(options, "hyper-clock")) hyper_clock = run("hyper-clock", capacity);
+      if (has_policy(options, "optimal")) optimal = run("optimal", capacity);
+
+      if (!first_point) std::cout << ",";
+      first_point = false;
+      std::cout << "{"
+                << "\"cacheBlocks\":" << capacity;
+      if (has_policy(options, "fifo")) {
+        std::cout << ",\"fifo\":{";
+        print_named_result("fifo", capacity, fifo, options.warmup_requests);
+        std::cout << "}";
+      }
+      if (has_policy(options, "lru")) {
+        std::cout << ",\"lru\":{";
+        print_named_result("lru", capacity, lru, options.warmup_requests);
+        std::cout << "}";
+      }
+      if (has_policy(options, "lru-flat")) {
+        std::cout << ",\"lru-flat\":{";
+        print_named_result("lru-flat", capacity, flat_lru, options.warmup_requests);
+        std::cout << "}";
+      }
+      if (has_policy(options, "hyper-clock")) {
+        std::cout << ",\"hyper-clock\":{";
+        print_named_result("hyper-clock", capacity, hyper_clock, options.warmup_requests);
+        std::cout << "}";
+      }
+      if (has_policy(options, "optimal")) {
+        std::cout << ",\"optimal\":{";
+        print_named_result("optimal", capacity, optimal, options.warmup_requests);
+        std::cout << "}";
+      }
+      if (run_sampled) {
+        std::cout << ",\"sampled-lru\":{";
+        print_named_result("sampled-lru", capacity, sampled, options.warmup_requests);
+        std::cout << "}";
+      }
+      std::cout << "}";
+
+      completed_steps += 1;
+      report_progress(options, completed_steps, total_steps, "capacity");
+    }
+    std::cout << "]}\n";
+  }
+
+ private:
+  const SimulationInput& input;
+  const Options& options;
+  SequentialRequestScheduler sequential;
+  std::optional<RecordedTimeScheduler> recorded;
+};
 
 }  // namespace
 
@@ -1198,19 +1299,11 @@ int main(int argc, char** argv) {
       std::cerr << "Skipping sampled-lru: request timing data unavailable\n";
     const bool run_sampled = input.timing_available && (options.policy == "sampled-lru"
       || options.policy == "all" || (options.policy == "batch" && has_policy(options, "sampled-lru")));
-    std::optional<RecordedTimeScheduler> scheduler;
-    if (run_sampled) scheduler.emplace(input.arrivals, input.completions, input.completion_order);
+    SimulationRunner runner(input, options, run_sampled);
     const std::uint64_t trie_node_count = input.prefix.parent.size();
-    if (options.policy == "batch") print_batch_results(input, options);
-    else if (options.policy == "ceiling") print_result("ceiling", options.capacity, simulate_ceiling(input, options), trie_node_count, options.warmup_requests);
-    else if (options.policy == "sampled-lru") print_result("sampled-lru", options.capacity, simulate_sampled(input, options.capacity, options), trie_node_count, options.warmup_requests);
-    else if (options.policy == "fifo") print_result("fifo", options.capacity, simulate_fifo(input, options.capacity, options), trie_node_count, options.warmup_requests);
-    else if (options.policy == "lru") print_result("lru", options.capacity, simulate_trie_policy(input, options.capacity, false, options), trie_node_count, options.warmup_requests);
-    else if (options.policy == "lru-flat") print_result("lru-flat", options.capacity, simulate_flat_lru(input, options.capacity, options), trie_node_count, options.warmup_requests);
-    else if (options.policy == "hyper-clock") print_result("hyper-clock", options.capacity, simulate_hyper_clock(input, options.capacity, options), trie_node_count, options.warmup_requests);
-    else if (options.policy == "optimal") print_result("optimal", options.capacity, simulate_trie_policy(input, options.capacity, true, options), trie_node_count, options.warmup_requests);
-    else if (options.policy == "all") print_all_results(options.capacity, simulate_all(input, options.capacity, options), trie_node_count, options.warmup_requests, input.timing_available);
-    else throw std::runtime_error("Unsupported policy: " + options.policy);
+    if (options.policy == "batch") runner.print_batch_results();
+    else if (options.policy == "all") print_all_results(options.capacity, runner.simulate_all(options.capacity), trie_node_count, options.warmup_requests, input.timing_available);
+    else print_result(options.policy, options.capacity, runner.run(options.policy, options.capacity), trie_node_count, options.warmup_requests);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n";

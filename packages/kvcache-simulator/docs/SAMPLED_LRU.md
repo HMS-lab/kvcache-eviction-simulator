@@ -95,17 +95,30 @@ Those descendants earn no read hits beyond a prefix hole.
 
 ## Reusable C++ scheduler
 
-The C++ backend uses the abstract `RequestScheduler` interface as a singleton.
-Only one scheduler instance can exist at a time.
+The C++ backend uses the abstract `RequestScheduler` interface.
+Its singleton accessor returns the active scheduler.
 Future scheduling strategies can implement this interface.
-Only Sampled LRU uses it now. The five other policies keep sequential replay.
 The Python backend keeps its existing scheduler.
 
-`RecordedTimeScheduler` implements the interface for recorded times.
-It constructs one sequence for all requested cache capacities.
+`SimulationRunner` constructs the schedulers once and reuses them across policies and cache capacities.
+It selects a fixed scheduler for each policy:
+
+- FIFO, LRU, LRU-FLAT, HYPER-CLOCK, and OPTIMAL use `SequentialRequestScheduler`.
+  The ceiling calculation also uses this scheduler.
+- Sampled LRU uses `RecordedTimeScheduler`.
+
+The existing policies keep their original behavior.
+There is no option to change a policy's scheduler.
+Each simulation uses a separate cache and random generator where applicable.
+
+`SequentialRequestScheduler` generates an arrival followed immediately by a completion for each request in file order.
+It stores only the event count and cursor.
+Its events use timestamp zero because the existing policies ignore timestamps.
+HyperClock retains its write offset between the arrival and completion.
+
+`RecordedTimeScheduler` constructs one sequence from the recorded times.
 Each request contributes an arrival event and a completion event.
 The sequence preserves the ordering rules above.
-Each capacity uses a separate cache and random generator.
 
 The interface provides these methods:
 
@@ -118,19 +131,26 @@ The interface provides these methods:
   At the end, the method returns no event.
 - `exhausted()` reports whether the cursor reached the end.
 - `discard_remaining()` moves the cursor to the end without cache operations.
-  Sampled LRU uses this method when a simulation stops early.
+  Policies use this method when a simulation stops early.
 - `reset()` returns the cursor to zero without reconstructing the sequence.
   It asserts that the previous iteration reached the end or explicitly discarded the remaining events.
 
-Sampled LRU resets the scheduler before it returns a result.
+Policies reset the scheduler after each iteration.
+A return before iteration leaves the cursor at zero.
 An early return discards the remaining events before reset.
-The next capacity starts with the same instance and a cursor of zero.
-The scheduler stores two 64-bit event codes per request, or 16 bytes per request.
+The next simulation starts with the same scheduler instance and a cursor of zero.
+The recorded-time scheduler stores two 64-bit event codes per request, or 16 bytes per request.
 It reads timestamps from the existing timing arrays. The owner must keep these arrays alive until it destroys the scheduler.
-The scheduler registers itself during construction and removes its registration during destruction.
+The owner activates the required scheduler before each simulation.
+Activation requires both the previous scheduler and the required scheduler to have a cursor of zero.
+Destruction removes the active registration if it belongs to that scheduler.
 The scheduler stores no cache blocks.
 
-C++ tests cover ordering, reuse, cancellation, and the abstract interface:
+C++ tests cover ordering, reuse, cancellation, and the abstract interface.
+`test_legacy_policies_match_results_before_extraction` checks recorded results for all five existing policies and the ceiling.
+`test_fixed_policy_schedulers_reused_after_all_return_paths` checks scheduler selection and reuse after normal, underfilled, and zero-capacity results.
+Both tests use the C++ backend:
+
 [NativeRequestSchedulerTests](../tests/test_request_scheduler.py).
 
 ## Eviction
