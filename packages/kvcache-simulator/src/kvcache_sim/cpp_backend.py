@@ -14,6 +14,7 @@ from typing import Callable, Iterable
 
 from .policies import PolicyResult, validate_hyper_clock_max_score
 from ._resources import package_resource_path, user_temp_suffix
+from .sampled import validate_parameters
 from .trace import TraceData
 
 UINT32_MAX = 2**32 - 1
@@ -34,6 +35,7 @@ class _BinaryTraceFiles:
     ids: Path
     tokens: Path
     request_ends: Path
+    timing: tuple[Path, ...] = ()
 
 
 def _cpp_source_path() -> Path:
@@ -61,7 +63,7 @@ def ensure_cpp_simulator(progress: ProgressCallback | None = None) -> Path:
 
 def _write_array(path: Path, typecode: str, values: Iterable[int]) -> None:
     data = array(typecode, values)
-    expected_size = 4 if typecode == "I" else 2
+    expected_size = {"I": 4, "H": 2, "Q": 8}[typecode]
     if data.itemsize != expected_size:
         raise RuntimeError(f"Unexpected array('{typecode}') item size: {data.itemsize}")
     with path.open("wb") as handle:
@@ -85,7 +87,14 @@ def _write_binary_trace(trace: TraceData, directory: Path) -> _BinaryTraceFiles:
     _write_array(tokens_path, "H", trace.tokens)
     _write_array(request_ends_path, "I", trace.request_starts[1:])
 
-    return _BinaryTraceFiles(ids=ids_path, tokens=tokens_path, request_ends=request_ends_path)
+    timing = ()
+    if trace.arrivals is not None:
+        timing = tuple(directory / name for name in ("arrivals.u64", "completions.u64", "order.u32"))
+        for path, code, values in zip(timing, ("Q", "Q", "I"), (trace.arrivals, trace.completions, trace.completion_order)):
+            if values is None or len(values) != trace.request_count:
+                raise ValueError("Incomplete request timing data")
+            _write_array(path, code, values)
+    return _BinaryTraceFiles(ids=ids_path, tokens=tokens_path, request_ends=request_ends_path, timing=timing)
 
 
 def _measurement_mode(measurement_start: int | None) -> str:
@@ -135,11 +144,18 @@ def run_cpp_sweep(
     policies: list[str],
     warmup_requests: int,
     hyper_clock_max_score: int = 3,
+    sampled_lru_threshold_seconds: float = 10.0,
+    sampled_lru_sample_size: int = 16,
+    sampled_lru_seed: int = 0,
     release_trace_data: bool = False,
     progress: ProgressCallback | None = None,
 ) -> CppSweepResult:
     """Run native replay; optionally consume the trace's event lists after writing."""
     validate_hyper_clock_max_score(hyper_clock_max_score)
+    threshold_us = (validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size, sampled_lru_seed)
+                    if "sampled-lru" in policies else 10_000_000)
+    if "sampled-lru" in policies and trace.arrivals is None:
+        raise ValueError("sampled-lru requires request timing data")
     event_count = len(trace.ids)
     binary = ensure_cpp_simulator(progress)
     safe_capacities = []
@@ -161,6 +177,7 @@ def run_cpp_sweep(
             trace.ids = []
             trace.tokens = []
             trace.request_starts = []
+            trace.arrivals = trace.completions = trace.completion_order = None
         command = [
             str(binary),
             "--policy",
@@ -184,6 +201,12 @@ def run_cpp_sweep(
             "--policies",
             ",".join(policies),
         ]
+        if "sampled-lru" in policies:
+            for flag, path in zip(("--request-arrivals", "--request-completions", "--request-order"), files.timing):
+                command.extend((flag, str(path)))
+            command.extend(("--sampled-lru-threshold-us", str(threshold_us),
+                            "--sampled-lru-sample-size", str(sampled_lru_sample_size),
+                            "--sampled-lru-seed", str(sampled_lru_seed)))
         if progress:
             command.append("--progress")
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

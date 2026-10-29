@@ -35,6 +35,13 @@ def render_table(result: dict[str, Any]) -> str:
     if "hyper-clock" in policies:
         max_score = meta.get("policyParameters", {}).get("hyper-clock", {}).get("maxScore", 3)
         lines.insert(-1, f"Hyper Clock max score: {max_score}")
+    if "sampled-lru" in policies:
+        params = meta["sampledLruParameters"]
+        lines.insert(-1, f"Sampled LRU: threshold {params['thresholdSeconds']}s, sample {params['sampleSize']}, seed {params['seed']}")
+        lines.insert(-1, "Replay: SAMPLED-LRU uses recorded arrivals/completions; other policies and the ceiling use sequential replay.")
+        lines.insert(-1, "Speedup is an ideal prefill bound, not measured latency or throughput.")
+    for policy, reason in meta.get("skippedPolicies", {}).items():
+        lines.insert(-1, f"Skipped {policy}: {reason}")
     headers = ["Budget", "Cache blocks"]
     for policy in policies:
         headers.append(f"{policy.upper()} hit")
@@ -44,9 +51,11 @@ def render_table(result: dict[str, Any]) -> str:
     for point in result.get("points", []):
         row = [f"{format_number(point['gib'])} GiB", format_number(point["cacheBlocks"])]
         for policy in policies:
-            row.append(format_percent(point["results"][policy]["hitRate"]))
+            result = point["results"][policy]
+            row.append("N/A" if result["measurementMode"] == "underfilled_at_window" else format_percent(result["hitRate"]))
         for policy in policies:
-            row.append(format_speedup(point["results"][policy]["idealPrefillSpeedup"]))
+            result = point["results"][policy]
+            row.append("N/A" if result["measurementMode"] == "underfilled_at_window" else format_speedup(result["idealPrefillSpeedup"]))
         rows.append(row)
     if not rows:
         lines.append("No budget point reached cache pressure before the 50% measurement window.")

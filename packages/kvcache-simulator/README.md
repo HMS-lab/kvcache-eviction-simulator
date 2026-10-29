@@ -57,7 +57,8 @@ Required fields:
 
 Optional fields:
 
-- `timestamp`: ignored by the simulator. Requests are replayed in file order, so sort production traces by timestamp before running the command.
+- `timestamp`: arrival time in seconds for Sampled LRU; ignored by the existing five policies. Sort traces by arrival before replay.
+- `completion_timestamp` / `api_time`: Sampled LRU completion time / duration in seconds. See [Sampled LRU documentation](docs/SAMPLED_LRU.md).
 - `output_length`: ignored by the hit-rate denominator. Generated output matters only if it appears later in another request's `hash_ids`.
 - `block_tokens`: advanced field for exact per-block token weights. If present, it must be a positive integer list with the same length as `hash_ids`.
 
@@ -86,7 +87,7 @@ Input and output support `.jsonl`, `.jsonl.gz`, and `-` for stdin/stdout. Summar
 
 Invalid records fail conversion with line/request context. File output is replaced atomically only on success, and temporary files are cleaned up on failure or interruption; stdout may contain partial output on failure. The converter accepts per-conversation `hash_id_scope: "local"` and requires consistent positive block sizes, nonempty conversation IDs/models/hash lists, positive input lengths, nonnegative output lengths, and finite nonnegative submission times and API durations.
 
-Scheduling uses recorded execution times to construct a workload; it does not predict timings for another model or server. The current simulator ignores timestamps and processes cache reads/writes in file order, without modeling in-flight execution or completion-dependent cache availability. The simulator also loads the converted trace into memory; the converter's memory behavior does not change that.
+Scheduling uses recorded execution times to construct a workload; it does not predict timings for another model or server. The five existing policies ignore timestamps and process reads/writes in file order. Sampled LRU additionally models arrivals, in-flight execution, and completion-time writes. The simulator also loads the converted trace into memory; the converter's memory behavior does not change that.
 
 ## Options
 
@@ -100,7 +101,7 @@ Scheduling uses recorded execution times to construct a workload; it does not pr
 | `--block-size N` | Fallback block size when trace records omit `block_size`; trace-declared `block_size` overrides it. |
 | `--estimate-tokens N` | Override the token count used for token-dependent bytes/token formulas. By default the trace average input length is used. |
 | `--budgets-gib A,B,C` | Comma-separated KV cache memory budgets in GiB. Default matches the web budget sweep: `1,2,4,...,16384`. |
-| `--policies fifo,lru,lru-flat,hyper-clock,optimal` | Eviction policies to simulate. Defaults to all five. |
+| `--policies fifo,lru,lru-flat,hyper-clock,optimal,sampled-lru` | Defaults to all six; Sampled LRU is skipped with a notice when timing is unavailable. |
 | `--hyper-clock-max-score N` | Hyper Clock score limit; default `3`. Must be an integer in `1..2^64-1`. |
 | `--backend cpp\|python` | Simulation backend. Default is `cpp`; use `python` for debugging or machines without a compiler. |
 | `--jobs N` | Number of worker processes for the Python backend. The C++ backend runs one batch process and ignores this option. |
@@ -204,3 +205,7 @@ The package bundles two files under `src/kvcache_sim/resources/`: `models.yaml`,
 pip install -e ./packages/kvcache-simulator
 pytest packages/kvcache-simulator
 ```
+
+### Sampled LRU and recorded-time replay
+
+See [Sampled LRU documentation](docs/SAMPLED_LRU.md) for configuration, timing, and eviction behavior.

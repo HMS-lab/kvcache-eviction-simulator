@@ -7,6 +7,9 @@
 #include <iostream>
 #include <list>
 #include <queue>
+#include <random>
+#include <tuple>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -33,6 +36,9 @@ struct Options {
   std::vector<std::uint32_t> capacities;
   std::vector<std::string> policies;
   bool progress = false;
+  std::string arrivals_path, completions_path, order_path;
+  std::uint64_t sampled_threshold = 10000000, sampled_seed = 0;
+  std::uint32_t sampled_size = 16;
 };
 
 struct Result {
@@ -68,6 +74,14 @@ std::uint64_t parse_clock_score(const std::string& value) {
     throw std::runtime_error("--hyper-clock-max-score must be a positive integer in 1..2^64-1");
   }
   return score;
+}
+
+std::uint64_t parse_sampled_u64(const std::string& value, const std::string& name) {
+  std::uint64_t parsed = 0;
+  const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+  if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || value.empty())
+    throw std::runtime_error("Invalid unsigned integer for " + name);
+  return parsed;
 }
 
 std::vector<std::uint32_t> parse_u32_csv(const std::string& value, const std::string& name) {
@@ -114,11 +128,21 @@ Options parse_args(int argc, char** argv) {
     else if (arg == "--capacities") options.capacities = parse_u32_csv(require_value(arg), arg);
     else if (arg == "--policies") options.policies = parse_string_csv(require_value(arg));
     else if (arg == "--hyper-clock-max-score") options.hyper_clock_max_score = parse_clock_score(require_value(arg));
+    else if (arg == "--request-arrivals") options.arrivals_path = require_value(arg);
+    else if (arg == "--request-completions") options.completions_path = require_value(arg);
+    else if (arg == "--request-order") options.order_path = require_value(arg);
+    else if (arg == "--sampled-lru-threshold-us") options.sampled_threshold = parse_sampled_u64(require_value(arg), arg);
+    else if (arg == "--sampled-lru-seed") options.sampled_seed = parse_sampled_u64(require_value(arg), arg);
+    else if (arg == "--sampled-lru-sample-size") {
+      auto n = parse_sampled_u64(require_value(arg), arg);
+      if (!n || n > 0xffffffffULL) throw std::runtime_error("Invalid sampled sample size");
+      options.sampled_size = n;
+    }
     else if (arg == "--progress") options.progress = true;
     else throw std::runtime_error("Unknown argument: " + arg);
   }
   if (options.policy.empty() || options.ids_path.empty() || options.tokens_path.empty() || options.total_blocks == 0) {
-    throw std::runtime_error("Usage: kv-cache-lab-native-sim --policy fifo|lru|lru-flat|hyper-clock|optimal|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--hyper-clock-max-score N] [--next PATH]");
+    throw std::runtime_error("Usage: kv-cache-lab-native-sim --policy fifo|lru|lru-flat|hyper-clock|optimal|sampled-lru|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--hyper-clock-max-score N] [--next PATH]");
   }
   if (options.policy != "build-next" && (options.request_ends_path.empty() || options.request_count == 0)) {
     throw std::runtime_error("--request-ends and --request-count are required");
@@ -229,6 +253,9 @@ struct SimulationInput {
   std::vector<std::uint16_t> tokens;
   std::vector<std::uint32_t> request_ends;
   PrefixPlan prefix;
+  std::vector<std::uint64_t> arrivals, completions;
+  std::vector<std::uint32_t> completion_order;
+  bool timing_available = false;
   std::uint32_t unique_blocks = 0;
 };
 
@@ -289,11 +316,37 @@ PrefixPlan build_prefix_plan(const std::vector<std::uint32_t>& ids,
   return plan;
 }
 
+template<typename T>
+std::vector<T> load_timing(const std::string& path, std::size_t count) {
+  std::ifstream stream(path, std::ios::binary | std::ios::ate);
+  if (!stream || stream.tellg() != static_cast<std::streamoff>(count * sizeof(T)))
+    throw std::runtime_error("Invalid timing file size: " + path);
+  stream.seekg(0);
+  std::vector<T> values(count);
+  stream.read(reinterpret_cast<char*>(values.data()), count * sizeof(T));
+  if (!stream) throw std::runtime_error("Cannot read timing file: " + path);
+  return values;
+}
+
 SimulationInput load_simulation_input(const Options& options) {
   SimulationInput input;
   input.ids = load_ids_all(options);
   input.tokens = load_tokens_all(options);
   input.request_ends = load_request_ends(options);
+  if (!options.arrivals_path.empty() || !options.completions_path.empty() || !options.order_path.empty()) {
+    input.arrivals = load_timing<std::uint64_t>(options.arrivals_path, options.request_count);
+    input.completions = load_timing<std::uint64_t>(options.completions_path, options.request_count);
+    input.completion_order = load_timing<std::uint32_t>(options.order_path, options.request_count);
+    std::vector<bool> ranks(options.request_count, false);
+    for (std::size_t i = 0; i < options.request_count; ++i) {
+      if ((i && input.arrivals[i] < input.arrivals[i-1]) || input.completions[i] < input.arrivals[i]
+          || input.arrivals[i] == UINT64_MAX || input.completions[i] == UINT64_MAX
+          || input.completion_order[i] >= options.request_count || ranks[input.completion_order[i]])
+        throw std::runtime_error("Invalid request timing or order");
+      ranks[input.completion_order[i]] = true;
+    }
+    input.timing_available = true;
+  }
   input.prefix = build_prefix_plan(input.ids, input.request_ends);
   input.unique_blocks = static_cast<std::uint32_t>(input.prefix.parent.size() - 1);
   return input;
@@ -782,12 +835,108 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
   return result;
 }
 
+struct SampledSlot {
+  std::uint32_t node = 0;
+  std::uint64_t timestamp = 0, sequence = 0;
+};
+struct SampledCache {
+  std::uint32_t capacity, sample_size;
+  std::uint64_t threshold, sequence = 0;
+  std::mt19937_64 rng;
+  std::vector<SampledSlot> slots;
+  std::vector<std::size_t> free;
+  std::unordered_map<std::uint32_t, std::size_t> entries;
+  SampledCache(std::uint32_t cap, const Options& o)
+      : capacity(cap), sample_size(o.sampled_size), threshold(o.sampled_threshold), rng(o.sampled_seed) {}
+  bool lookup(std::uint32_t node, std::uint64_t now) {
+    auto it = entries.find(node);
+    if (it == entries.end()) return false;
+    auto& slot = slots[it->second]; slot.timestamp = now; slot.sequence = ++sequence;
+    return true;
+  }
+  void discard(std::size_t index) {
+    entries.erase(slots[index].node); slots[index] = {}; free.push_back(index);
+  }
+  bool eligible(const SampledSlot& slot, std::uint64_t now, std::uint64_t age) const {
+    return slot.node != 0 && (age == 0 || now - slot.timestamp > age);
+  }
+  void evict(std::uint64_t now) {
+    std::vector<SampledSlot> sample;
+    std::sample(slots.begin(), slots.end(), std::back_inserter(sample),
+                std::min<std::size_t>(sample_size, slots.size()), rng);
+    std::sort(sample.begin(), sample.end(), [](const auto& a, const auto& b) {
+      return std::tie(a.timestamp, a.sequence) < std::tie(b.timestamp, b.sequence);
+    });
+    for (const auto& slot : sample) if (eligible(slot, now, threshold)) discard(entries.at(slot.node));
+    if (!free.empty()) return;
+    auto age = threshold;
+    for (;;) {
+      for (std::size_t i = 0; i < slots.size(); ++i) if (eligible(slots[i], now, age)) { discard(i); return; }
+      age /= 2;
+    }
+  }
+  void write(std::uint32_t node, std::uint64_t now) {
+    if (!capacity || lookup(node, now)) return;
+    if (entries.size() == capacity) evict(now);
+    std::size_t index;
+    if (free.empty()) { index = slots.size(); slots.push_back({}); }
+    else { index = free.back(); free.pop_back(); }
+    slots[index] = {node, now, ++sequence}; entries[node] = index;
+  }
+};
+
+Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, const Options& options) {
+  if (!input.timing_available) throw std::runtime_error("sampled-lru requires complete request timing data");
+  if (!capacity) return no_cache_result(input, options);
+  SampledCache cache(capacity, options);
+  using Event = std::tuple<std::uint64_t, std::uint32_t, std::uint32_t>;
+  std::priority_queue<Event, std::vector<Event>, std::greater<Event>> pending;
+  Result result;
+  result.measurement_start_request = options.warmup_requests;
+  bool full = false;
+  std::uint32_t cursor = 0;
+  const auto count = input.request_ends.size();
+  auto complete = [&](std::uint64_t now) {
+    while (!pending.empty() && std::get<0>(pending.top()) == now) {
+      const auto request = std::get<2>(pending.top()); pending.pop();
+      auto start = request ? input.request_ends[request - 1] : 0;
+      for (auto i = start; i < input.request_ends[request]; ++i) {
+        cache.write(input.prefix.node_for_event[i], now);
+        if (cache.entries.size() == capacity) full = true;
+      }
+    }
+  };
+  while (cursor < count || !pending.empty()) {
+    const auto arrival = cursor < count ? input.arrivals[cursor] : UINT64_MAX;
+    const auto now = std::min(arrival, pending.empty() ? UINT64_MAX : std::get<0>(pending.top()));
+    complete(now);
+    while (cursor < count && input.arrivals[cursor] == now) {
+      if (cursor >= options.warmup_requests && !full) return underfilled_result(input, options);
+      const auto start = cursor ? input.request_ends[cursor - 1] : 0;
+      bool alive = true;
+      for (auto i = start; i < input.request_ends[cursor]; ++i) {
+        if (cursor >= options.warmup_requests) result.total_tokens += input.tokens[i];
+        if (alive) {
+          alive = cache.lookup(input.prefix.node_for_event[i], now);
+          if (alive && cursor >= options.warmup_requests) result.hit_tokens += input.tokens[i];
+        }
+      }
+      pending.emplace(input.completions[cursor], input.completion_order[cursor], cursor);
+      ++cursor;
+    }
+    complete(now);
+  }
+  if (!full || !result.total_tokens) return underfilled_result(input, options);
+  return result;
+}
+
 struct AllResults {
   Result fifo;
   Result lru;
   Result flat_lru;
   Result hyper_clock;
   Result optimal;
+  Result sampled;
 };
 
 AllResults simulate_all(const SimulationInput& input, std::uint32_t capacity, const Options& options) {
@@ -797,6 +946,7 @@ AllResults simulate_all(const SimulationInput& input, std::uint32_t capacity, co
     simulate_flat_lru(input, capacity, options),
     simulate_hyper_clock(input, capacity, options),
     simulate_trie_policy(input, capacity, true, options),
+    input.timing_available ? simulate_sampled(input, capacity, options) : Result{},
   };
 }
 
@@ -834,7 +984,7 @@ void print_named_result(const char* policy, std::uint64_t cache_blocks, const Re
             << "\"usefulCacheRate\":" << std::setprecision(17) << result.useful_cache_rate(cache_blocks);
 }
 
-void print_all_results(std::uint64_t cache_blocks, const AllResults& results, std::uint64_t trie_node_count, std::uint64_t warmup_requests) {
+void print_all_results(std::uint64_t cache_blocks, const AllResults& results, std::uint64_t trie_node_count, std::uint64_t warmup_requests, bool timing = false) {
   std::cout << "{"
             << "\"cacheBlocks\":" << cache_blocks << ","
             << "\"trieNodeCount\":" << trie_node_count << ","
@@ -848,7 +998,13 @@ void print_all_results(std::uint64_t cache_blocks, const AllResults& results, st
   print_named_result("hyper-clock", cache_blocks, results.hyper_clock, warmup_requests);
   std::cout << "},\"optimal\":{";
   print_named_result("optimal", cache_blocks, results.optimal, warmup_requests);
-  std::cout << "}}\n";
+  std::cout << "}";
+  if (timing) {
+    std::cout << ",\"sampled-lru\":{";
+    print_named_result("sampled-lru", cache_blocks, results.sampled, warmup_requests);
+    std::cout << "}";
+  }
+  std::cout << "}\n";
 }
 
 void print_batch_results(const SimulationInput& input, const Options& options) {
@@ -875,6 +1031,9 @@ void print_batch_results(const SimulationInput& input, const Options& options) {
     Result flat_lru;
     Result hyper_clock;
     Result optimal;
+    Result sampled;
+    const bool run_sampled = has_policy(options, "sampled-lru") && input.timing_available;
+    if (run_sampled) sampled = simulate_sampled(input, capacity, options);
     if (has_policy(options, "fifo")) fifo = simulate_fifo(input, capacity, options);
     if (has_policy(options, "lru")) lru = simulate_trie_policy(input, capacity, false, options);
     if (has_policy(options, "lru-flat")) flat_lru = simulate_flat_lru(input, capacity, options);
@@ -910,6 +1069,11 @@ void print_batch_results(const SimulationInput& input, const Options& options) {
       print_named_result("optimal", capacity, optimal, options.warmup_requests);
       std::cout << "}";
     }
+    if (run_sampled) {
+      std::cout << ",\"sampled-lru\":{";
+      print_named_result("sampled-lru", capacity, sampled, options.warmup_requests);
+      std::cout << "}";
+    }
     std::cout << "}";
 
     completed_steps += 1;
@@ -931,15 +1095,20 @@ int main(int argc, char** argv) {
 
     report_progress(options, 0, 1 + options.capacities.size(), "load");
     const SimulationInput input = load_simulation_input(options);
+    const bool requested_sampled = options.policy == "sampled-lru" || std::find(options.policies.begin(), options.policies.end(), "sampled-lru") != options.policies.end();
+    if (requested_sampled && !input.timing_available) throw std::runtime_error("sampled-lru requires complete request timing data");
+    if (!input.timing_available && !requested_sampled && (options.policy == "all" || (options.policy == "batch" && options.policies.empty())))
+      std::cerr << "Skipping sampled-lru: request timing data unavailable\n";
     const std::uint64_t trie_node_count = input.prefix.parent.size();
     if (options.policy == "batch") print_batch_results(input, options);
     else if (options.policy == "ceiling") print_result("ceiling", options.capacity, simulate_ceiling(input, options), trie_node_count, options.warmup_requests);
+    else if (options.policy == "sampled-lru") print_result("sampled-lru", options.capacity, simulate_sampled(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "fifo") print_result("fifo", options.capacity, simulate_fifo(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "lru") print_result("lru", options.capacity, simulate_trie_policy(input, options.capacity, false, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "lru-flat") print_result("lru-flat", options.capacity, simulate_flat_lru(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "hyper-clock") print_result("hyper-clock", options.capacity, simulate_hyper_clock(input, options.capacity, options), trie_node_count, options.warmup_requests);
     else if (options.policy == "optimal") print_result("optimal", options.capacity, simulate_trie_policy(input, options.capacity, true, options), trie_node_count, options.warmup_requests);
-    else if (options.policy == "all") print_all_results(options.capacity, simulate_all(input, options.capacity, options), trie_node_count, options.warmup_requests);
+    else if (options.policy == "all") print_all_results(options.capacity, simulate_all(input, options.capacity, options), trie_node_count, options.warmup_requests, input.timing_available);
     else throw std::runtime_error("Unsupported policy: " + options.policy);
     return 0;
   } catch (const std::exception& error) {

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import gzip
 import json
+import math
 from pathlib import Path
 import sys
 from typing import Any, Iterable, TextIO
@@ -21,6 +22,28 @@ class TraceData:
     parse_errors: int
     skipped_records: int
     ids_len: int
+    arrivals: list[int] | None = None
+    completions: list[int] | None = None
+    completion_order: list[int] | None = None
+    timing_error: str | None = None
+
+
+def seconds_us(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError("expected finite nonnegative seconds")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite:
+        raise ValueError("expected finite nonnegative seconds")
+    try:
+        result = round(value * 1_000_000)
+    except (OverflowError, ValueError) as error:
+        raise ValueError("time exceeds uint64 microseconds") from error
+    if not 0 <= result < 2**64:
+        raise ValueError("time exceeds uint64 microseconds")
+    return result
 
 
 def block_tokens(input_length: int, block_size: int, index: int, count: int) -> int:
@@ -75,7 +98,12 @@ def parse_trace_lines(
     block_size: int | None = None,
     max_records: int = 0,
     max_events: int = 0,
+    timing_mode: str = "optional",
 ) -> TraceData:
+    if timing_mode not in {"optional", "required", "ignore"}:
+        raise ValueError("Invalid timing_mode")
+    arrivals, completions, keys = [], [], []
+    timing_error = "Timing parsing disabled" if timing_mode == "ignore" else None
     fallback_block_size = int(block_size or 0)
     trace_block_size = 0
     interner = _Interner()
@@ -161,6 +189,29 @@ def parse_trace_lines(
                 invalid_block_tokens += 1
                 continue
 
+        if timing_error is None:
+            try:
+                arrival = seconds_us(record.get("timestamp"))
+                if "completion_timestamp" in record:
+                    finish = seconds_us(record["completion_timestamp"])
+                else:
+                    finish = arrival + seconds_us(record.get("api_time"))
+                if "api_time" in record and abs(finish - arrival - seconds_us(record["api_time"])) > 1:
+                    raise ValueError("completion_timestamp disagrees with timestamp + api_time")
+                if finish < arrival or finish >= 2**64 or (arrivals and arrival < arrivals[-1]):
+                    raise ValueError("times must be ordered and completion must follow arrival")
+                key = (str(record.get("conversation_id", "")), int(record.get("conversation_index", 0)),
+                       int(record.get("request_index", request_count)), request_count)
+                arrivals.append(arrival)
+                completions.append(finish)
+                keys.append(key)
+            except (ValueError, TypeError, OverflowError) as error:
+                timing_error = f"request {request_count + 1}: {error}"
+                arrivals.clear()
+                completions.clear()
+                keys.clear()
+                if timing_mode == "required":
+                    raise ValueError(f"sampled-lru requires valid timing: {timing_error}") from error
         raw_requests.append((parsed_ids, input_length, explicit_block_tokens))
         request_count += 1
         raw_event_count += len(parsed_ids)
@@ -197,7 +248,14 @@ def parse_trace_lines(
             total_input_tokens += tok
 
     request_starts.append(len(ids))
+    order = [0] * request_count if timing_error is None else None
+    if order is not None:
+        for rank, index in enumerate(sorted(range(request_count), key=keys.__getitem__)):
+            order[index] = rank
     return TraceData(
+        arrivals=arrivals if timing_error is None else None,
+        completions=completions if timing_error is None else None,
+        completion_order=order, timing_error=timing_error,
         ids=ids,
         tokens=tokens,
         request_starts=request_starts,
@@ -218,11 +276,12 @@ def parse_trace_file(
     block_size: int | None = None,
     max_records: int = 0,
     max_events: int = 0,
+    timing_mode: str = "optional",
 ) -> TraceData:
     handle = _open_text(path)
     close = handle is not sys.stdin
     try:
-        return parse_trace_lines(handle, block_size=block_size, max_records=max_records, max_events=max_events)
+        return parse_trace_lines(handle, block_size=block_size, max_records=max_records, max_events=max_events, timing_mode=timing_mode)
     finally:
         if close:
             handle.close()

@@ -45,8 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--block-size", type=int, default=None, help="Fallback block size when trace records omit block_size; record block_size overrides this value")
         command.add_argument("--estimate-tokens", type=int, default=None, help="Override calculator token count used for bytes/token")
         command.add_argument("--budgets-gib", default=",".join(str(v) for v in DEFAULT_BUDGETS_GIB), help="Comma-separated GiB budgets")
-        command.add_argument("--policies", default=",".join(DEFAULT_POLICIES), help=f"Comma-separated policies: {','.join(DEFAULT_POLICIES)}")
+        command.add_argument("--policies", default=None, help=f"Comma-separated policies (default: all): {','.join(DEFAULT_POLICIES)}")
         command.add_argument("--hyper-clock-max-score", type=_parse_hyper_clock_max_score, default=3, help="Hyper Clock maximum score, a positive integer (default: 3)")
+        command.add_argument("--sampled-lru-threshold-seconds", type=float, default=10.0, help="Sampled LRU age threshold in seconds (default: 10)")
+        command.add_argument("--sampled-lru-sample-size", type=int, default=16, help="Number of sampled slots (default: 16)")
+        command.add_argument("--sampled-lru-seed", type=int, default=0, help="Sampled LRU random seed (default: 0)")
         command.add_argument("--backend", choices=["cpp", "python"], default="cpp", help="Simulation backend (default: cpp)")
         command.add_argument("--jobs", type=int, default=1, help="Worker processes for the Python backend; ignored by the C++ backend")
         command.add_argument("--no-progress", action="store_true", help="Disable terminal progress output")
@@ -80,7 +83,9 @@ def run_sweep_command(args: argparse.Namespace) -> int:
     try:
         data = load_models_data(args.models_yaml)
         progress.update(0, 4, "reading trace")
-        trace = parse_trace_file(args.trace, block_size=args.block_size, max_records=args.max_records, max_events=args.max_events)
+        policies = _parse_csv_strings(args.policies) if args.policies else None
+        timing_mode = "optional" if not policies else "required" if "sampled-lru" in policies else "ignore"
+        trace = parse_trace_file(args.trace, block_size=args.block_size, max_records=args.max_records, max_events=args.max_events, timing_mode=timing_mode)
         progress.update(1, 4, "trace loaded")
         result = run_sweep(
             trace,
@@ -88,7 +93,10 @@ def run_sweep_command(args: argparse.Namespace) -> int:
             precision=args.kv_precision,
             indexer_precision=args.indexer_precision,
             budgets_gib=_parse_csv_numbers(args.budgets_gib),
-            policies=_parse_csv_strings(args.policies),
+            policies=policies,
+            sampled_lru_threshold_seconds=args.sampled_lru_threshold_seconds,
+            sampled_lru_sample_size=args.sampled_lru_sample_size,
+            sampled_lru_seed=args.sampled_lru_seed,
             hyper_clock_max_score=args.hyper_clock_max_score,
             release_trace_data=True,
             jobs=args.jobs,
@@ -98,6 +106,8 @@ def run_sweep_command(args: argparse.Namespace) -> int:
             include_draft_kv_cache=args.include_draft_kv_cache,
             models_data=data,
         )
+        for policy, reason in result["metadata"].get("skippedPolicies", {}).items():
+            print(f"Skipping {policy}: {reason}", file=sys.stderr)
         rendered = render_json(result) if args.format == "json" else render_table(result)
         _write_output(rendered, args.output)
         progress.finish()

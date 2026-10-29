@@ -22,6 +22,9 @@ class ExecutionPlan:
     total_measured_tokens: int
     total_input_tokens: int
     average_input_tokens: float
+    arrivals: list[int] | None = None
+    completions: list[int] | None = None
+    completion_order: list[int] | None = None
 
 
 def build_execution_plan(trace: TraceData, warmup_fraction: float = 0.5) -> ExecutionPlan:
@@ -61,6 +64,7 @@ def build_execution_plan(trace: TraceData, warmup_fraction: float = 0.5) -> Exec
         for index in range(trace.request_starts[request_index], trace.request_starts[request_index + 1])
     )
     return ExecutionPlan(
+        arrivals=trace.arrivals, completions=trace.completions, completion_order=trace.completion_order,
         ids=trace.ids,
         tokens=trace.tokens,
         request_starts=trace.request_starts,

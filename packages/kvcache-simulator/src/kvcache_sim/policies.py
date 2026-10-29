@@ -458,8 +458,20 @@ def simulate_trie_policy(plan: ExecutionPlan, capacity: int, *, optimal: bool) -
     return _finish(policy, capacity, plan, hit_tokens, total_tokens)
 
 
-def simulate_policy(plan: ExecutionPlan, policy: str, capacity: int, *, hyper_clock_max_score: int = 3) -> PolicyResult:
+def simulate_policy(
+    plan: ExecutionPlan, policy: str, capacity: int, *,
+    hyper_clock_max_score: int = 3,
+    sampled_lru_threshold_seconds: float = 10.0,
+    sampled_lru_sample_size: int = 16,
+    sampled_lru_seed: int = 0,
+) -> PolicyResult:
     validate_hyper_clock_max_score(hyper_clock_max_score)
+    if policy == "sampled-lru":
+        from .sampled import simulate_sampled
+        return simulate_sampled(
+            plan, capacity, threshold=sampled_lru_threshold_seconds,
+            sample_size=sampled_lru_sample_size, seed=sampled_lru_seed,
+        )
     if policy == "fifo":
         return simulate_fifo(plan, capacity)
     if policy == "lru":

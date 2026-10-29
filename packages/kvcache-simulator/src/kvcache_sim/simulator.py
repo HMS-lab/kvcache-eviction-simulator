@@ -9,10 +9,11 @@ from .calculator import BYTES_PER_GIB, calculate_cache_size, load_models_data, m
 from .cpp_backend import run_cpp_sweep
 from .plan import ExecutionPlan, build_execution_plan
 from .policies import PolicyResult, simulate_ceiling, simulate_policy, validate_hyper_clock_max_score
+from .sampled import validate_parameters
 from .trace import TraceData
 
 DEFAULT_BUDGETS_GIB = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-DEFAULT_POLICIES = ["fifo", "lru", "lru-flat", "hyper-clock", "optimal"]
+DEFAULT_POLICIES = ["fifo", "lru", "lru-flat", "hyper-clock", "optimal", "sampled-lru"]
 THROUGHPUT_EPSILON = 0.001
 THROUGHPUT_DISPLAY_CAP = 1000.0
 
@@ -38,25 +39,25 @@ def cache_blocks_for_gib(gib: float, bytes_per_block: float) -> int:
     return max(0, math.floor(gib * BYTES_PER_GIB / bytes_per_block))
 
 
-def _worker_simulate(task: tuple[str, int, int]) -> tuple[tuple[str, int], PolicyResult]:
+def _worker_simulate(task: tuple[str, int, int, dict[str, Any]]) -> tuple[tuple[str, int], PolicyResult]:
     if _WORKER_PLAN is None:
         raise RuntimeError("Worker plan is not initialized")
-    policy, capacity, max_score = task
-    return (policy, capacity), simulate_policy(_WORKER_PLAN, policy, capacity, hyper_clock_max_score=max_score)
+    policy, capacity, max_score, sampled = task
+    return (policy, capacity), simulate_policy(_WORKER_PLAN, policy, capacity, hyper_clock_max_score=max_score, **sampled)
 
 
-def _simulate_tasks(plan: ExecutionPlan, tasks: list[tuple[str, int]], jobs: int, *, hyper_clock_max_score: int = 3) -> dict[tuple[str, int], PolicyResult]:
+def _simulate_tasks(plan: ExecutionPlan, tasks: list[tuple[str, int]], jobs: int, *, hyper_clock_max_score: int = 3, **sampled) -> dict[tuple[str, int], PolicyResult]:
     if not tasks:
         return {}
     if jobs <= 1 or "fork" not in mp.get_all_start_methods():
-        return {task: simulate_policy(plan, task[0], task[1], hyper_clock_max_score=hyper_clock_max_score) for task in tasks}
+        return {task: simulate_policy(plan, task[0], task[1], hyper_clock_max_score=hyper_clock_max_score, **sampled) for task in tasks}
 
     global _WORKER_PLAN
     _WORKER_PLAN = plan
     context = mp.get_context("fork")
     try:
         with context.Pool(processes=min(jobs, len(tasks))) as pool:
-            return dict(pool.imap_unordered(_worker_simulate, ((policy, capacity, hyper_clock_max_score) for policy, capacity in tasks)))
+            return dict(pool.imap_unordered(_worker_simulate, ((policy, capacity, hyper_clock_max_score, sampled) for policy, capacity in tasks)))
     finally:
         _WORKER_PLAN = None
 
@@ -91,6 +92,9 @@ def run_sweep(
     budgets_gib: list[float] | None = None,
     policies: list[str] | None = None,
     hyper_clock_max_score: int = 3,
+    sampled_lru_threshold_seconds: float = 10.0,
+    sampled_lru_sample_size: int = 16,
+    sampled_lru_seed: int = 0,
     jobs: int = 1,
     backend: str = "cpp",
     progress: ProgressCallback | None = None,
@@ -125,7 +129,19 @@ def run_sweep(
     )
     bytes_per_block = float(cache_size.bytes_per_block or cache_size.bytes_per_token * trace.block_size)
     selected_budgets = sorted(set(budgets_gib or DEFAULT_BUDGETS_GIB))
-    selected_policies = policies or DEFAULT_POLICIES
+    selected_policies = list(policies or DEFAULT_POLICIES)
+    sampled = dict(sampled_lru_threshold_seconds=sampled_lru_threshold_seconds,
+                   sampled_lru_sample_size=sampled_lru_sample_size, sampled_lru_seed=sampled_lru_seed)
+    skipped = {}
+    if "sampled-lru" in selected_policies:
+        validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size, sampled_lru_seed)
+        if any(values is None or len(values) != trace.request_count for values in
+               (trace.arrivals, trace.completions, trace.completion_order)):
+            reason = trace.timing_error or "Complete request timing data is required"
+            if policies:
+                raise ValueError(f"sampled-lru: {reason}")
+            skipped["sampled-lru"] = reason
+            selected_policies.remove("sampled-lru")
     for policy in selected_policies:
         if policy not in DEFAULT_POLICIES:
             raise ValueError(f"Unsupported policy: {policy}")
@@ -149,6 +165,7 @@ def run_sweep(
             policies=selected_policies,
             warmup_requests=warmup_requests,
             hyper_clock_max_score=hyper_clock_max_score,
+            **sampled,
             release_trace_data=release_trace_data,
             progress=cpp_progress,
         )
@@ -174,7 +191,7 @@ def run_sweep(
                     tasks.append(task)
         if progress:
             progress(3, 4, "running Python simulation")
-        sim_results = _simulate_tasks(plan, tasks, max(1, int(jobs or 1)), hyper_clock_max_score=hyper_clock_max_score)
+        sim_results = _simulate_tasks(plan, tasks, max(1, int(jobs or 1)), hyper_clock_max_score=hyper_clock_max_score, **sampled)
         ceiling = simulate_ceiling(plan)
     points: list[dict[str, Any]] = []
     for gib, capacity in capacities:
@@ -188,7 +205,8 @@ def run_sweep(
             else:
                 result = sim_results[(policy, capacity)]
             if result.measurementMode == "underfilled_at_window":
-                underfilled = True
+                if policy != "sampled-lru" or len(selected_policies) == 1:
+                    underfilled = True
             result_json = result.to_json()
             result_json["idealPrefillSpeedup"] = throughput_from_hit_rate(result.hitRate)
             results[policy] = result_json
@@ -201,6 +219,11 @@ def run_sweep(
     return {
         "metadata": {
             **({"policyParameters": {"hyper-clock": {"maxScore": hyper_clock_max_score}}} if "hyper-clock" in selected_policies else {}),
+            "skippedPolicies": skipped,
+            "replayModes": {p: "recorded" if p == "sampled-lru" else "sequential" for p in selected_policies},
+            "ceilingReplayMode": "sequential",
+            **({"sampledLruParameters": {"thresholdSeconds": sampled_lru_threshold_seconds,
+                "sampleSize": sampled_lru_sample_size, "seed": sampled_lru_seed}} if "sampled-lru" in selected_policies else {}),
             "modelId": cache_size.model_id,
             "modelLabel": cache_size.model_label,
             "precision": cache_size.precision,
@@ -221,6 +244,8 @@ def run_sweep(
             "warmupRequests": warmup_requests,
             "measurementWindow": "last_50_percent_requests" if warmup_fraction == 0.5 else f"last_{max(0.0, 1.0 - warmup_fraction):.6f}_fraction_requests",
             "underfilledBudgetPolicy": "omit_budget_and_larger_points",
+            **({"sampledLruUnderfilledPolicy": "mark_unavailable_preserve_legacy_points"}
+               if "sampled-lru" in selected_policies and len(selected_policies) > 1 else {}),
             "speedupBaseline": "1.0x equals no-cache prefill throughput where every prefill input token is computed.",
             "totalMeasuredTokens": total_measured_tokens,
             "averageInputTokens": trace.average_input_tokens,
