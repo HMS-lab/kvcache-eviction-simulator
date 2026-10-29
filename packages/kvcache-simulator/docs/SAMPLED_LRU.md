@@ -1,13 +1,15 @@
 # Sampled LRU and recorded-time replay
 
-`sampled-lru` runs by default alongside the five existing policies when the trace
-has usable timing. **The existing policies retain their original algorithms and
-sequential replay; they ignore timestamps.** A default run skips Sampled LRU with
-a notice if timing is missing or invalid. Explicitly requesting it instead reports
-an error. JSON lists effective policies and `metadata.skippedPolicies`; CLI notices
-are written to stderr.
+`sampled-lru` runs by default with the five existing policies when the trace has
+valid timing data. **The existing policies keep their original algorithms and
+sequential replay. They ignore timestamps.**
 
-Your converted SemiAnalysis JSONL can be used directly, without another conversion:
+A default run skips Sampled LRU if timing data is missing or invalid.
+The CLI reports the reason in a notice. An explicit request for Sampled LRU
+reports an error instead. JSON lists the policies that run and
+`metadata.skippedPolicies`. The CLI writes notices to stderr.
+
+Use your converted SemiAnalysis JSONL directly. No further conversion is necessary:
 
 ```bash
 kvcache-simulator run --trace converted.jsonl --model glm-5.2 \
@@ -15,73 +17,144 @@ kvcache-simulator run --trace converted.jsonl --model glm-5.2 \
   --sampled-lru-sample-size 16 --sampled-lru-seed 0
 ```
 
-All three policy parameters are optional; their defaults are **10 seconds**, 16
-sampled blocks, and seed 0. Threshold zero makes every resident block eligible.
-Sampling uses Python `random.sample` and C++ `std::sample` without replacement.
-Each capacity starts with a fresh seeded generator. Repeated runs in the same
-backend/runtime are reproducible; Python and C++ need not produce identical
-samples, evictions, or hit rates. C++ standard sampling scans the population.
+## Defaults and sampling
 
-Timing fields are numeric seconds, normalized to integer microseconds. Each request
-needs `timestamp` and either `completion_timestamp` or `api_time` (or both, agreeing
-within one microsecond). Completion is `timestamp + api_time`; an absolute
-`completion_timestamp` already includes the start. Times must be finite,
-nonnegative, ordered by arrival, and finish no earlier than arrival. Equal arrivals
-retain file order. Python parsers accept `timing_mode="optional"` (default),
-`"required"`, or `"ignore"`; sweep/policy APIs accept `sampled_lru_threshold_seconds`,
-`sampled_lru_sample_size`, and `sampled_lru_seed`.
+All three policy parameters are optional. The defaults are:
 
-The virtual clock jumps between arrivals and completions without real-time waiting.
-Previously admitted completions run before arrivals at the same time. Completion
-ties sort by `(conversation_id, conversation_index, request_index, input_ordinal)`;
-conversation IDs compare lexicographically, indices numerically. Missing identifiers
-use an empty conversation ID, conversation index zero, and the input ordinal as
-request index. Zero-duration requests complete after the entire arrival batch.
+- A threshold of **10 seconds**.
+- A sample size of 16 blocks.
+- A random seed of 0.
 
-At arrival, reads count and refresh only the continuous cached prefix, stopping at
-the first hole. At completion, the entire input is written in prefix order,
-refreshing existing exact nodes or inserting missing ones. Membership is checked
-on each write. Entries evicted while in flight can be restored; writes can evict
-earlier entries of the same request without restarting repairs. Identical raw
-blocks reached through different prefixes occupy different entries. Evicting an
-ancestor leaves descendants resident, but they earn no read hits beyond a hole.
+A threshold of zero makes every resident block eligible for eviction.
+A resident block is a block that the cache currently stores.
 
-On a full-cache insertion, sample up to the configured number of resident entries
-and evict **all** sampled entries strictly older than the threshold. Extra free
-slots serve later writes without further sampling. If none qualify, scan slots
-from index zero and stop when one eligible victim is found. If a complete scan
-finds none, halve a local copy of the threshold and restart. Integer halving
-reaches zero, where even entries accessed at the current time are eligible. Every
-new eviction operation starts with the configured threshold again. Slots remain
-stable and free slots are reused last-in-first-out; oversized requests write one
-block at a time.
+Python uses `random.sample`. C++ uses `std::sample`. Both functions sample
+without replacement. Each cache capacity starts with a new generator that uses
+the configured seed.
 
-Warmup and measurement still use request counts. Sampled LRU must fill the cache
-before the first measured arrival; unavailable results appear as `N/A` in mixed
-sweeps and do not suppress existing-policy budget points. New-policy-only sweeps
-omit underfilled budgets. Replay modes and policy parameters are included in
-metadata. The existing ceiling uses sequential replay. `idealPrefillSpeedup` remains
-a hit-rate-derived bound, not measured latency or throughput.
+Repeated runs in the same backend and runtime produce the same results.
+Python and C++ need not produce identical samples, evictions, or hit rates.
+C++ standard sampling scans the population.
 
-Recorded service durations never change with simulated cache hits. Active request
-working state is modeled separately from reusable cache capacity, with no pinning,
-in-flight computation sharing, active GPU memory accounting, or publication of
-generated-output block identities. Timing-aware latency prediction and dependent
-turn rescheduling are outside this replay model.
+## Trace timing
 
-Timing adds two uint64 values and one uint32 rank per request in the native input,
-plus in-flight heap and per-cache recency metadata. It does not add timestamps per
-trace block. The CLI continues releasing Python event and timing arrays before C++
-starts. API calls preserve their input by default; `release_trace_data=True` also
-consumes timing arrays. This is not a hard 4 GB memory guarantee.
+Timing fields contain numeric seconds. The simulator converts these values to
+integer microseconds. Each request needs `timestamp` and at least one of
+`completion_timestamp` or `api_time`. If both completion fields exist, `completion_timestamp` must match
+`timestamp + api_time` within one microsecond.
+
+Completion time is `timestamp + api_time`. An absolute `completion_timestamp`
+already includes the start time. Timing values must meet these conditions:
+
+- Each value is finite and nonnegative.
+- Arrival times follow chronological order.
+- Each request finishes at or after its arrival time.
+
+Requests with equal arrival times keep their file order.
+
+Python parsers accept three values for `timing_mode`:
+
+- `"optional"` is the default.
+- `"required"` requires valid timing data.
+- `"ignore"` ignores timing data.
+
+The sweep and policy APIs accept these parameters:
+
+- `sampled_lru_threshold_seconds`.
+- `sampled_lru_sample_size`.
+- `sampled_lru_seed`.
+
+## Clock and cache access
+
+The virtual clock jumps between arrivals and completions without waiting in
+real time. Previously admitted requests complete before new requests arrive at
+the same time.
+
+Requests with equal completion times use this sort key:
+`(conversation_id, conversation_index, request_index, input_ordinal)`.
+Conversation IDs use lexicographical order. Indices use numeric order.
+Missing identifiers use an empty conversation ID, conversation index zero, and
+the input ordinal as the request index.
+
+Zero-duration requests complete after the entire batch of arrivals at that time.
+
+At arrival, the simulator reads only the continuous cached prefix.
+A prefix hole is the first missing block in that prefix.
+Reads count hits and refresh entries only before the first hole.
+
+At completion, the simulator writes the entire input in prefix order.
+It refreshes existing exact nodes and inserts missing nodes.
+It checks cache membership on each write.
+Writes can restore entries that the cache evicted while the request was in flight.
+
+A write can evict an earlier entry from the same request.
+The writer does not restart repairs. Identical raw blocks reached through
+different prefixes occupy different entries.
+Evicting an ancestor leaves its descendants in the cache.
+Those descendants earn no read hits beyond a prefix hole.
+
+## Eviction
+
+When an insertion finds the cache full, the policy samples up to the configured
+number of resident entries. It evicts **all** sampled entries strictly older than
+the threshold. Later writes use the extra free slots without further sampling.
+
+If no sampled entry qualifies, the policy uses this fallback:
+
+1. Scan slots from index zero.
+2. Stop after finding and evicting one eligible entry.
+3. If a complete scan finds no eligible entry, halve a local copy of the threshold.
+4. Restart the scan from index zero.
+5. Repeat until one entry qualifies.
+
+Integer halving reaches zero. At zero, entries accessed at the current time
+also qualify. Each new eviction operation starts with the configured threshold.
+Slots keep their positions. The policy reuses free slots in last-in-first-out
+order. Requests larger than the cache write one block at a time.
+
+## Measurement
+
+Warmup and measurement use request counts. Sampled LRU must fill the cache
+before the first measured arrival. Mixed sweeps show unavailable results as
+`N/A`. These results do not suppress budget points for the existing policies.
+Sweeps that run only Sampled LRU omit underfilled budgets.
+
+Metadata includes replay modes and policy parameters. The existing ceiling uses
+sequential replay. `idealPrefillSpeedup` is a bound derived from the hit rate.
+It does not measure latency or throughput.
+
+## Model limits and memory
+
+Recorded service durations do not change with simulated cache hits.
+The model keeps active request working state separate from reusable cache capacity.
+It excludes these mechanisms:
+
+- Pinning entries.
+- Sharing computation between requests in flight.
+- Accounting for active GPU memory.
+- Publishing block identities for generated output.
+
+The model does not predict latency from timing data.
+It does not reschedule dependent turns.
+
+Timing adds two uint64 values and one uint32 rank per request to the native input.
+It also adds an in-flight heap and recency metadata for each cache.
+It does not add timestamps per trace block.
+
+The CLI releases Python event and timing arrays before C++ starts.
+API calls keep their input by default. With `release_trace_data=True`, API calls
+also consume timing arrays. This behavior does not guarantee a 4 GB memory limit.
 
 ## Worked examples
 
-All times below are **seconds**; tests convert them to integer microseconds.
+All times below are **seconds**; the C++ test fixtures convert them to integer microseconds.
 `A@4` means a prefix-specific cache entry named A last accessed at time 4.
 `--` is a free slot. Slot indices are zero-based. The threshold is 10 seconds
 in every example. Samples are explicitly chosen where shown, so the examples do
-not depend on Python and C++ generating the same random sequence.
+not depend on Python and C++ generating the same random sequence. All five
+examples execute the actual **C++ backend** in a temporary native test harness;
+Python only compiles and launches the harness. Test-only hooks control samples
+and record cache events without changing production source.
 
 ### 1. Evict every eligible sampled entry, then reuse the free slots
 
@@ -112,7 +185,7 @@ C survives because its age is **exactly** 10, rather than strictly greater than
 one; F consumes the spare slot at time 21 without sampling again.
 
 Test: [test_sampled_lru_examples.py —
-DocumentedExamplesTests.test_batch_eviction_and_free_slot_reuse](../tests/test_sampled_lru_examples.py#L33).
+NativeDocumentedExamplesTests.test_batch_eviction_and_free_slot_reuse](../tests/test_sampled_lru_examples.py#L170).
 
 ### 2. An unhelpful sample falls back to a linear scan
 
@@ -138,7 +211,7 @@ and no second sample. The fallback stops once this insertion has space; the
 sampling phase is the phase that evicts every eligible member of its sample.
 
 Test: [test_sampled_lru_examples.py —
-DocumentedExamplesTests.test_sample_miss_falls_back_to_first_eligible_slot](../tests/test_sampled_lru_examples.py#L53).
+NativeDocumentedExamplesTests.test_sample_miss_falls_back_to_first_eligible_slot](../tests/test_sampled_lru_examples.py#L173).
 
 ### 3. Halving is local, and zero permits eviction of same-time entries
 
@@ -177,7 +250,7 @@ it permits eviction even when `last_access_time == now`. Only the local scan
 threshold changes; the next eviction starts at the configured value.
 
 Test: [test_sampled_lru_examples.py —
-DocumentedExamplesTests.test_threshold_halving_resets_and_reaches_zero](../tests/test_sampled_lru_examples.py#L67).
+NativeDocumentedExamplesTests.test_threshold_halving_resets_and_reaches_zero](../tests/test_sampled_lru_examples.py#L176).
 
 ### 4. A prefix hole stops reads; completion writes refresh the entire input
 
@@ -221,7 +294,7 @@ root -- A -- B -- C     B and C here belong to prefix A
 ```
 
 Test: [test_sampled_lru_examples.py —
-DocumentedExamplesTests.test_prefix_hole_and_completion_refresh](../tests/test_sampled_lru_examples.py#L92).
+NativeDocumentedExamplesTests.test_prefix_hole_and_completion_refresh](../tests/test_sampled_lru_examples.py#L179).
 
 ### 5. In-flight computation is unavailable until completion
 
@@ -252,8 +325,7 @@ they finish. After the last arrival at time 5, the clock still visits completion
 at times 6 and 7.
 
 Measured hit tokens are **64**, total tokens are **128**, and hit rate is
-**50%**. The test checks the exact read/write events and final timestamp, and
-also checks the result with the C++ backend when a compiler is available.
+**50%**. The test checks the exact read/write events and final timestamp, directly in the C++ backend. A C++ compiler is required to run these examples.
 
 Test: [test_sampled_lru_examples.py —
-DocumentedExamplesTests.test_clock_overlap_and_completion_before_arrival](../tests/test_sampled_lru_examples.py#L135).
+NativeDocumentedExamplesTests.test_clock_overlap_and_completion_before_arrival](../tests/test_sampled_lru_examples.py#L182).
