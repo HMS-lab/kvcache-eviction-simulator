@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <cassert>
+#include <optional>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
@@ -257,6 +259,104 @@ struct SimulationInput {
   std::vector<std::uint32_t> completion_order;
   bool timing_available = false;
   std::uint32_t unique_blocks = 0;
+};
+
+enum class ScheduledEventKind { Arrival, Completion };
+
+struct ScheduledEvent {
+  std::uint32_t request;
+  ScheduledEventKind kind;
+  std::uint64_t timestamp;
+};
+
+class RequestScheduler {
+ public:
+  virtual ~RequestScheduler() { instance_ = nullptr; }
+  RequestScheduler(const RequestScheduler&) = delete;
+  RequestScheduler& operator=(const RequestScheduler&) = delete;
+
+  static RequestScheduler& get() {
+    assert(instance_);
+    assert(instance_->at_start());
+    return *instance_;
+  }
+  virtual std::optional<ScheduledEvent> next_event() = 0;
+  virtual bool exhausted() const = 0;
+  virtual void discard_remaining() = 0;
+
+  void reset() {
+    assert(exhausted());
+    reset_impl();
+  }
+
+ protected:
+  RequestScheduler() {
+    assert(!instance_);
+    instance_ = this;
+  }
+  virtual bool at_start() const = 0;
+  virtual void reset_impl() = 0;
+
+ private:
+  inline static RequestScheduler* instance_ = nullptr;
+};
+
+class RecordedTimeScheduler final : public RequestScheduler {
+ public:
+  RecordedTimeScheduler(const std::vector<std::uint64_t>& arrivals,
+                        const std::vector<std::uint64_t>& completions,
+                        const std::vector<std::uint32_t>& completion_order)
+      : arrivals_(arrivals), completions_(completions) {
+    assert(arrivals.size() == completions.size() && arrivals.size() == completion_order.size());
+    events_.reserve(arrivals.size() * 2);
+    using Pending = std::tuple<std::uint64_t, std::uint32_t, std::uint32_t>;
+    std::priority_queue<Pending, std::vector<Pending>, std::greater<Pending>> pending;
+    std::size_t cursor = 0;
+    auto complete = [&](std::uint64_t now) {
+      while (!pending.empty() && std::get<0>(pending.top()) == now) {
+        append(std::get<2>(pending.top()), ScheduledEventKind::Completion);
+        pending.pop();
+      }
+    };
+    while (cursor < arrivals.size() || !pending.empty()) {
+      const auto arrival = cursor < arrivals.size() ? arrivals[cursor] : UINT64_MAX;
+      const auto now = std::min(arrival, pending.empty() ? UINT64_MAX : std::get<0>(pending.top()));
+      complete(now);
+      while (cursor < arrivals.size() && arrivals[cursor] == now) {
+        append(static_cast<std::uint32_t>(cursor), ScheduledEventKind::Arrival);
+        pending.emplace(completions[cursor], completion_order[cursor], static_cast<std::uint32_t>(cursor));
+        ++cursor;
+      }
+      complete(now);
+    }
+  }
+
+  std::optional<ScheduledEvent> next_event() override {
+    if (exhausted()) return std::nullopt;
+    const auto encoded = events_[cursor_++];
+    const auto request = static_cast<std::uint32_t>(encoded >> 1);
+    const auto kind = (encoded & 1) ? ScheduledEventKind::Completion : ScheduledEventKind::Arrival;
+    return ScheduledEvent{request, kind,
+      kind == ScheduledEventKind::Arrival ? arrivals_[request] : completions_[request]};
+  }
+
+  bool exhausted() const override { return cursor_ == events_.size(); }
+  void discard_remaining() override { cursor_ = events_.size(); }
+
+ protected:
+  bool at_start() const override { return cursor_ == 0; }
+  void reset_impl() override { cursor_ = 0; }
+
+ private:
+  void append(std::uint32_t request, ScheduledEventKind kind) {
+    events_.push_back((static_cast<std::uint64_t>(request) << 1)
+                     | (kind == ScheduledEventKind::Completion ? 1ULL : 0ULL));
+  }
+
+  const std::vector<std::uint64_t>& arrivals_;
+  const std::vector<std::uint64_t>& completions_;
+  std::vector<std::uint64_t> events_;
+  std::size_t cursor_ = 0;
 };
 
 PrefixPlan build_prefix_plan(const std::vector<std::uint32_t>& ids,
@@ -887,45 +987,42 @@ struct SampledCache {
 
 Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, const Options& options) {
   if (!input.timing_available) throw std::runtime_error("sampled-lru requires complete request timing data");
-  if (!capacity) return no_cache_result(input, options);
+  auto& scheduler = RequestScheduler::get();
+  if (!capacity) {
+    scheduler.discard_remaining();
+    scheduler.reset();
+    return no_cache_result(input, options);
+  }
   SampledCache cache(capacity, options);
-  using Event = std::tuple<std::uint64_t, std::uint32_t, std::uint32_t>;
-  std::priority_queue<Event, std::vector<Event>, std::greater<Event>> pending;
   Result result;
   result.measurement_start_request = options.warmup_requests;
   bool full = false;
-  std::uint32_t cursor = 0;
-  const auto count = input.request_ends.size();
-  auto complete = [&](std::uint64_t now) {
-    while (!pending.empty() && std::get<0>(pending.top()) == now) {
-      const auto request = std::get<2>(pending.top()); pending.pop();
-      auto start = request ? input.request_ends[request - 1] : 0;
-      for (auto i = start; i < input.request_ends[request]; ++i) {
-        cache.write(input.prefix.node_for_event[i], now);
+  while (const auto event = scheduler.next_event()) {
+    const auto request = event->request;
+    const auto start = request ? input.request_ends[request - 1] : 0;
+    const auto end = input.request_ends[request];
+    if (event->kind == ScheduledEventKind::Completion) {
+      for (auto i = start; i < end; ++i) {
+        cache.write(input.prefix.node_for_event[i], event->timestamp);
         if (cache.entries.size() == capacity) full = true;
       }
-    }
-  };
-  while (cursor < count || !pending.empty()) {
-    const auto arrival = cursor < count ? input.arrivals[cursor] : UINT64_MAX;
-    const auto now = std::min(arrival, pending.empty() ? UINT64_MAX : std::get<0>(pending.top()));
-    complete(now);
-    while (cursor < count && input.arrivals[cursor] == now) {
-      if (cursor >= options.warmup_requests && !full) return underfilled_result(input, options);
-      const auto start = cursor ? input.request_ends[cursor - 1] : 0;
+    } else {
+      if (request >= options.warmup_requests && !full) {
+        scheduler.discard_remaining();
+        scheduler.reset();
+        return underfilled_result(input, options);
+      }
       bool alive = true;
-      for (auto i = start; i < input.request_ends[cursor]; ++i) {
-        if (cursor >= options.warmup_requests) result.total_tokens += input.tokens[i];
+      for (auto i = start; i < end; ++i) {
+        if (request >= options.warmup_requests) result.total_tokens += input.tokens[i];
         if (alive) {
-          alive = cache.lookup(input.prefix.node_for_event[i], now);
-          if (alive && cursor >= options.warmup_requests) result.hit_tokens += input.tokens[i];
+          alive = cache.lookup(input.prefix.node_for_event[i], event->timestamp);
+          if (alive && request >= options.warmup_requests) result.hit_tokens += input.tokens[i];
         }
       }
-      pending.emplace(input.completions[cursor], input.completion_order[cursor], cursor);
-      ++cursor;
     }
-    complete(now);
   }
+  scheduler.reset();
   if (!full || !result.total_tokens) return underfilled_result(input, options);
   return result;
 }
@@ -1099,6 +1196,10 @@ int main(int argc, char** argv) {
     if (requested_sampled && !input.timing_available) throw std::runtime_error("sampled-lru requires complete request timing data");
     if (!input.timing_available && !requested_sampled && (options.policy == "all" || (options.policy == "batch" && options.policies.empty())))
       std::cerr << "Skipping sampled-lru: request timing data unavailable\n";
+    const bool run_sampled = input.timing_available && (options.policy == "sampled-lru"
+      || options.policy == "all" || (options.policy == "batch" && has_policy(options, "sampled-lru")));
+    std::optional<RecordedTimeScheduler> scheduler;
+    if (run_sampled) scheduler.emplace(input.arrivals, input.completions, input.completion_order);
     const std::uint64_t trie_node_count = input.prefix.parent.size();
     if (options.policy == "batch") print_batch_results(input, options);
     else if (options.policy == "ceiling") print_result("ceiling", options.capacity, simulate_ceiling(input, options), trie_node_count, options.warmup_requests);

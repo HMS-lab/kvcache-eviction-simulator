@@ -93,6 +93,46 @@ different prefixes occupy different entries.
 Evicting an ancestor leaves its descendants in the cache.
 Those descendants earn no read hits beyond a prefix hole.
 
+## Reusable C++ scheduler
+
+The C++ backend uses the abstract `RequestScheduler` interface as a singleton.
+Only one scheduler instance can exist at a time.
+Future scheduling strategies can implement this interface.
+Only Sampled LRU uses it now. The five other policies keep sequential replay.
+The Python backend keeps its existing scheduler.
+
+`RecordedTimeScheduler` implements the interface for recorded times.
+It constructs one sequence for all requested cache capacities.
+Each request contributes an arrival event and a completion event.
+The sequence preserves the ordering rules above.
+Each capacity uses a separate cache and random generator.
+
+The interface provides these methods:
+
+- `RequestScheduler::get()` returns the shared instance.
+  It asserts that the instance exists and its cursor is zero.
+  Policies call this method instead of receiving a scheduler argument.
+
+- `next_event()` returns the next event and advances the cursor.
+  Each event contains a request index, an event kind, and a timestamp.
+  At the end, the method returns no event.
+- `exhausted()` reports whether the cursor reached the end.
+- `discard_remaining()` moves the cursor to the end without cache operations.
+  Sampled LRU uses this method when a simulation stops early.
+- `reset()` returns the cursor to zero without reconstructing the sequence.
+  It asserts that the previous iteration reached the end or explicitly discarded the remaining events.
+
+Sampled LRU resets the scheduler before it returns a result.
+An early return discards the remaining events before reset.
+The next capacity starts with the same instance and a cursor of zero.
+The scheduler stores two 64-bit event codes per request, or 16 bytes per request.
+It reads timestamps from the existing timing arrays. The owner must keep these arrays alive until it destroys the scheduler.
+The scheduler registers itself during construction and removes its registration during destruction.
+The scheduler stores no cache blocks.
+
+C++ tests cover ordering, reuse, cancellation, and the abstract interface:
+[NativeRequestSchedulerTests](../tests/test_request_scheduler.py).
+
 ## Eviction
 
 When an insertion finds the cache full, the policy samples up to the configured

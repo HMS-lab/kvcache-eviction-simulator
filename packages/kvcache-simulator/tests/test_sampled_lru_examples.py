@@ -84,7 +84,7 @@ void prefix() {
   const auto a=i.prefix.node_for_event[0], b=i.prefix.node_for_event[1], c=i.prefix.node_for_event[2];
   preload = {{a,0},{c,0}};
   auto o=options(3); o.warmup_requests=1;
-  auto r=simulate_sampled(i,3,o);
+  RecordedTimeScheduler scheduler(i.arrivals,i.completions,i.completion_order); auto r=simulate_sampled(i,3,o);
   assert((reads == std::vector<std::tuple<unsigned,std::uint64_t,bool>>{
     {a,10*S,true},{b,10*S,false},{a,13*S,true},{b,13*S,true},{c,13*S,true}}));
   assert(writes.size()==6);
@@ -101,7 +101,7 @@ void prefix() {
 void clock_example() {
   auto i=input({1,2,2,2},{1,2,3,4},{0,0,2*S,5*S},{S,5*S,6*S,7*S});
   auto o=options(1); o.warmup_requests=2;
-  auto r=simulate_sampled(i,1,o);
+  RecordedTimeScheduler scheduler(i.arrivals,i.completions,i.completion_order); auto r=simulate_sampled(i,1,o);
   assert((reads == std::vector<std::tuple<unsigned,std::uint64_t,bool>>{
     {1,0,false},{2,0,false},{2,2*S,false},{2,5*S,true}}));
   assert(writes.size()==4);
