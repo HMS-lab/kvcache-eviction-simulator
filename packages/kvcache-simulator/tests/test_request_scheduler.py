@@ -56,34 +56,26 @@ void sequential_lifecycle(bool premature) {
   assert(empty.exhausted() && !empty.next_event());
   empty.reset();
 }
-void activation_guard(bool target_partial) {
-  SequentialRequestScheduler active(2), inactive(2, false);
-  if (target_partial) inactive.next_event();
-  else active.next_event();
-  RequestScheduler::activate(inactive);
-}
-void fixed_policy_schedulers() {
+void shared_policy_scheduler() {
   SimulationInput input;
   input.ids = {1,1,1}; input.tokens = {64,64,64}; input.request_ends = {1,2,3};
   input.arrivals = {0,1,2}; input.completions = {10,11,12};
   input.completion_order = {0,1,2}; input.timing_available = true;
   input.prefix = build_prefix_plan(input.ids,input.request_ends);
-  Options options; options.warmup_requests = 1;
-  SimulationRunner runner(input, options, true);
-  RequestScheduler* sequential = nullptr;
-  RequestScheduler* recorded = nullptr;
-  for (unsigned capacity : {1,99,0,1}) {
-    for (const auto* policy : {"ceiling","fifo","lru","lru-flat","hyper-clock","optimal","sampled-lru"}) {
-      const auto result = runner.run(policy, capacity);
-      auto* current = &RequestScheduler::get();
-      if (std::string(policy) == "sampled-lru") {
-        assert(dynamic_cast<RecordedTimeScheduler*>(current));
-        assert(!recorded || recorded == current); recorded = current;
-        if (capacity == 1) assert(result.measurement_start_request == -2);
-      } else {
-        assert(dynamic_cast<SequentialRequestScheduler*>(current));
-        assert(!sequential || sequential == current); sequential = current;
-        if (capacity == 1) assert(result.hit_tokens == 128);
+  for (const auto* strategy : {"sequential", "recorded"}) {
+    Options options; options.warmup_requests = 1; options.scheduler = strategy;
+    SimulationRunner runner(input, options);
+    RequestScheduler* selected = &RequestScheduler::get();
+    assert((dynamic_cast<RecordedTimeScheduler*>(selected) != nullptr) == (options.scheduler == "recorded"));
+    for (unsigned capacity : {1,99,0,1}) {
+      for (const auto* policy : {"ceiling","fifo","lru","lru-flat","hyper-clock","optimal","sampled-lru"}) {
+        const auto result = runner.run(policy, capacity);
+        assert(&RequestScheduler::get() == selected);
+        if (capacity == 1) {
+          if (options.scheduler == "sequential") assert(result.hit_tokens == 128);
+          else if (std::string(policy) == "ceiling") assert(result.hit_tokens == 0);
+          else assert(result.measurement_start_request == -2);
+        }
       }
     }
   }
@@ -100,8 +92,8 @@ void legacy_regression() {
     input.request_ends.push_back(input.ids.size());
   }
   input.prefix = build_prefix_plan(input.ids,input.request_ends);
-  Options options; options.warmup_requests = 4;
-  SimulationRunner runner(input, options, false);
+  Options options; options.warmup_requests = 4; options.scheduler = "sequential";
+  SimulationRunner runner(input, options);
   const std::vector<std::string> policies{"fifo","lru","lru-flat","hyper-clock","optimal"};
   // Captured from the C++ executable before the scheduler extraction.
   const std::vector<unsigned> capacities{0,1,2,3,4,5,6,7,8,99,3};
@@ -177,9 +169,7 @@ int main(int argc, char** argv) {
   std::string mode = argv[1];
   if (mode == "sequential") sequential_lifecycle(false);
   else if (mode == "sequential-premature") sequential_lifecycle(true);
-  else if (mode == "activate-partial") activation_guard(false);
-  else if (mode == "activate-target-partial") activation_guard(true);
-  else if (mode == "fixed-policy-schedulers") fixed_policy_schedulers();
+  else if (mode == "shared-policy-scheduler") shared_policy_scheduler();
   else if (mode == "legacy-regression") legacy_regression();
   else if (mode == "lifecycle") lifecycle(false);
   else if (mode == "premature") lifecycle(true);
@@ -190,7 +180,7 @@ int main(int argc, char** argv) {
     auto expected = static_cast<unsigned>(std::stoul(mode));
     const auto result = simulator_main(argc-1,argv+1);
     assert(scheduler_constructions == expected);
-    assert(sequential_constructions == 1);
+    assert(sequential_constructions == 1 - expected);
     return result;
   }
 }
@@ -226,14 +216,14 @@ class NativeRequestSchedulerTests(unittest.TestCase):
     def test_sequential_order_exhaustion_reset_and_discard(self):
         subprocess.run([str(self.binary), 'sequential'], check=True, capture_output=True)
 
-    def test_fixed_policy_schedulers_reused_after_all_return_paths(self):
-        subprocess.run([str(self.binary), 'fixed-policy-schedulers'], check=True, capture_output=True)
+    def test_selected_scheduler_shared_after_all_return_paths(self):
+        subprocess.run([str(self.binary), 'shared-policy-scheduler'], check=True, capture_output=True)
 
     def test_legacy_policies_match_results_before_extraction(self):
         subprocess.run([str(self.binary), 'legacy-regression'], check=True, capture_output=True)
 
-    def test_sequential_reset_and_activation_guards(self):
-        for mode in ('sequential-premature', 'activate-partial', 'activate-target-partial'):
+    def test_sequential_reset_guard(self):
+        for mode in ('sequential-premature',):
             with self.subTest(mode=mode):
                 result = subprocess.run([str(self.binary), mode], capture_output=True, text=True,
                                         cwd=self.directory.name)
@@ -273,7 +263,7 @@ class NativeRequestSchedulerTests(unittest.TestCase):
                     '--request-completions', str(files.timing[1]), '--request-order', str(files.timing[2])]
 
             def run(*args, expected=1):
-                completed = subprocess.run([str(self.binary), str(expected), *base, *args],
+                completed = subprocess.run([str(self.binary), str(expected), *base, '--scheduler', 'recorded' if expected else 'sequential', *args],
                                            capture_output=True, text=True, check=True)
                 return json.loads(completed.stdout)
 

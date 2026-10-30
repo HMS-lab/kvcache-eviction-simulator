@@ -268,9 +268,9 @@ class HyperClockTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     simulate_policy(plan, "hyper-clock", 0, hyper_clock_max_score=value)
                 with self.assertRaises(ValueError):
-                    run_sweep(trace, model_id="qwen3-32b", hyper_clock_max_score=value)
+                    run_sweep(trace, scheduler="sequential", model_id="qwen3-32b", hyper_clock_max_score=value)
                 with self.assertRaises(ValueError):
-                    run_cpp_sweep(trace, capacities=[0], policies=["hyper-clock"], warmup_requests=1,
+                    run_cpp_sweep(trace, scheduler="sequential", capacities=[0], policies=["hyper-clock"], warmup_requests=1,
                                   hyper_clock_max_score=value)
 
     def test_worker_configuration_matches_serial_and_changes_outcome(self):
@@ -293,7 +293,7 @@ class HyperClockTests(unittest.TestCase):
             for value in ("0", "-1", "1.5", "abc", str(2**64)):
                 with self.subTest(command=command, value=value), contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit) as error:
-                        build_parser().parse_args([command, "--trace", "unused", "--model", "qwen3-32b",
+                        build_parser().parse_args([command, "--scheduler", "sequential", "--trace", "unused", "--model", "qwen3-32b",
                                                    "--hyper-clock-max-score", value])
                     self.assertEqual(error.exception.code, 2)
 
@@ -459,7 +459,7 @@ int main() {
             for fraction in (0, 0.5, 1):
                 plan = build_execution_plan(trace, fraction)
                 for limit in (1, 3, 7):
-                    native = run_cpp_sweep(trace, capacities=[0, 1, 2, 3, 4, 100], policies=["hyper-clock"],
+                    native = run_cpp_sweep(trace, scheduler="sequential", capacities=[0, 1, 2, 3, 4, 100], policies=["hyper-clock"],
                                            warmup_requests=plan.warmup_requests, hyper_clock_max_score=limit)
                     for capacity in (0, 1, 2, 3, 4, 100):
                         with self.subTest(events=len(trace.ids), warmup=fraction, limit=limit, capacity=capacity):
@@ -476,7 +476,7 @@ int main() {
         binary = ensure_cpp_simulator()
         with tempfile.TemporaryDirectory() as directory:
             files = _write_binary_trace(trace, Path(directory))
-            base = [str(binary), "--ids", str(files.ids), "--tokens", str(files.tokens),
+            base = [str(binary), "--scheduler", "sequential", "--ids", str(files.ids), "--tokens", str(files.tokens),
                     "--request-ends", str(files.request_ends), "--request-count", str(trace.request_count),
                     "--total-blocks", str(len(trace.ids)), "--warmup-requests", "2", "--capacity", "3"]
             for mode in ("hyper-clock", "all", "batch"):
@@ -503,7 +503,7 @@ int main() {
             trace_file = Path(directory) / "trace.jsonl"
             trace_file.write_text("\n".join(json.dumps({"block_size": 1, "hash_ids": path, "input_length": 1})
                                              for path in paths), encoding="utf-8")
-            base = ["--trace", str(trace_file), "--model", "qwen3-32b", "--policies", "hyper-clock",
+            base = ["--scheduler", "sequential", "--trace", str(trace_file), "--model", "qwen3-32b", "--policies", "hyper-clock",
                     "--budgets-gib", "0.0005", "--hyper-clock-max-score", "7", "--no-progress"]
             results = []
             for backend in ("python", "cpp"):

@@ -1,18 +1,20 @@
 # Sampled LRU and recorded-time replay
 
-`sampled-lru` runs by default with the five existing policies when the trace has
-valid timing data. **The existing policies keep their original algorithms and
-sequential replay. They ignore timestamps.**
+The C++ backend runs `sampled-lru` with the five existing policies by default.
+Every policy uses the scheduler selected with the required `--scheduler` option.
+The ceiling uses the same scheduler.
 
-A default run skips Sampled LRU if timing data is missing or invalid.
-The CLI reports the reason in a notice. An explicit request for Sampled LRU
-reports an error instead. JSON lists the policies that run and
-`metadata.skippedPolicies`. The CLI writes notices to stderr.
+Choose `recorded` to use trace timing and concurrent requests.
+Missing or invalid timing data stops recorded-time replay.
+Choose `sequential` for immediate reads and writes in file order.
+Sequential replay ignores timing fields and keeps the virtual clock at zero.
+The five existing policies preserve their original replay behavior with this scheduler.
+See the [scheduler comparison](../README.md#request-schedulers) for examples and tradeoffs.
 
 Use your converted SemiAnalysis JSONL directly. No further conversion is necessary:
 
 ```bash
-kvcache-simulator run --trace converted.jsonl --model glm-5.2 \
+kvcache-simulator run --scheduler recorded --trace converted.jsonl --model glm-5.2 \
   --policies sampled-lru --sampled-lru-threshold-seconds 10 \
   --sampled-lru-sample-size 16 --sampled-lru-seed 0
 ```
@@ -66,7 +68,7 @@ The sweep and policy APIs accept these parameters:
 
 ## Clock and cache access
 
-The virtual clock jumps between arrivals and completions without waiting in
+With the recorded-time scheduler, the virtual clock jumps between arrivals and completions without waiting in
 real time. Previously admitted requests complete before new requests arrive at
 the same time.
 
@@ -100,25 +102,24 @@ Its singleton accessor returns the active scheduler.
 Future scheduling strategies can implement this interface.
 The Python backend keeps its existing scheduler.
 
-`SimulationRunner` constructs the schedulers once and reuses them across policies and cache capacities.
-It selects a fixed scheduler for each policy:
-
-- FIFO, LRU, LRU-FLAT, HYPER-CLOCK, and OPTIMAL use `SequentialRequestScheduler`.
-  The ceiling calculation also uses this scheduler.
-- Sampled LRU uses `RecordedTimeScheduler`.
-
-The existing policies keep their original behavior.
-There is no option to change a policy's scheduler.
+`SimulationRunner` constructs only the selected scheduler, once per invocation.
+All policies and cache capacities reuse that instance.
+Policies do not select their own scheduler.
 Each simulation uses a separate cache and random generator where applicable.
 
 `SequentialRequestScheduler` generates an arrival followed immediately by a completion for each request in file order.
 It stores only the event count and cursor.
-Its events use timestamp zero because the existing policies ignore timestamps.
-HyperClock retains its write offset between the arrival and completion.
+Its events use timestamp zero.
+A positive Sampled LRU threshold cannot expire entries while the clock stays at zero.
+Eviction therefore uses the threshold-halving fallback.
+A threshold of zero makes every sampled resident block eligible immediately.
 
 `RecordedTimeScheduler` constructs one sequence from the recorded times.
 Each request contributes an arrival event and a completion event.
 The sequence preserves the ordering rules above.
+HyperClock stores a separate write offset for each request in flight.
+It restores read hits that the cache evicts before completion.
+OPTIMAL excludes past arrivals when it selects future-use priorities at completion.
 
 The interface provides these methods:
 
@@ -141,17 +142,16 @@ An early return discards the remaining events before reset.
 The next simulation starts with the same scheduler instance and a cursor of zero.
 The recorded-time scheduler stores two 64-bit event codes per request, or 16 bytes per request.
 It reads timestamps from the existing timing arrays. The owner must keep these arrays alive until it destroys the scheduler.
-The owner activates the required scheduler before each simulation.
-Activation requires both the previous scheduler and the required scheduler to have a cursor of zero.
-Destruction removes the active registration if it belongs to that scheduler.
+The selected scheduler registers itself during construction and removes its registration during destruction.
 The scheduler stores no cache blocks.
 
 C++ tests cover ordering, reuse, cancellation, and the abstract interface.
 `test_legacy_policies_match_results_before_extraction` checks recorded results for all five existing policies and the ceiling.
-`test_fixed_policy_schedulers_reused_after_all_return_paths` checks scheduler selection and reuse after normal, underfilled, and zero-capacity results.
+`test_selected_scheduler_shared_after_all_return_paths` checks scheduler reuse after normal, underfilled, and zero-capacity results.
 Both tests use the C++ backend:
 
 [NativeRequestSchedulerTests](../tests/test_request_scheduler.py).
+[SchedulerSelectionTests](../tests/test_scheduler_selection.py) checks CLI selection and concurrent replay for all C++ policies.
 
 ## Eviction
 
@@ -179,8 +179,9 @@ before the first measured arrival. Mixed sweeps show unavailable results as
 `N/A`. These results do not suppress budget points for the existing policies.
 Sweeps that run only Sampled LRU omit underfilled budgets.
 
-Metadata includes replay modes and policy parameters. The existing ceiling uses
-sequential replay. `idealPrefillSpeedup` is a bound derived from the hit rate.
+Metadata includes the selected scheduler, replay modes, and policy parameters.
+The ceiling uses the selected scheduler.
+`idealPrefillSpeedup` is a bound derived from the hit rate.
 It does not measure latency or throughput.
 
 ## Model limits and memory

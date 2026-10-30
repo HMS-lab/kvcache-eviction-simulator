@@ -8,14 +8,17 @@
 pip install kvcache-simulator
 ```
 
-The default simulation backend compiles and runs a bundled C++ replay core on first use. You need a local C++ compiler such as `c++` or `clang++`. If a compiler is not available, use `--backend python`.
+The default backend compiles the bundled C++ simulator on first use.
+You need a local C++ compiler such as `c++` or `clang++`.
+The Python backend supports sequential replay for the five existing policies.
+It does not support recorded-time replay or sequential Sampled LRU.
 
 ## Quick Start
 
 ```bash
- kvcache-simulator run  --trace ~/ai_traces/mooncake_trace.jsonl  --model glm-5.2  --kv-precision fp8_int8  --indexer-precision fp4_int4 --block-size 512
+ kvcache-simulator run --scheduler sequential --trace ~/ai_traces/mooncake_trace.jsonl  --model glm-5.2  --kv-precision fp8_int8  --indexer-precision fp4_int4 --block-size 512
 
- kvcache-simulator run  --trace ~/ai_traces/semianalysis_converted_concurrency_10.jsonl  --model glm-5.2  --kv-precision fp8_int8  --indexer-precision fp4_int4 --block-size 512 --hyper-clock-max-score 3
+ kvcache-simulator run --scheduler recorded --trace ~/ai_traces/semianalysis_converted_concurrency_10.jsonl  --model glm-5.2  --kv-precision fp8_int8  --indexer-precision fp4_int4 --block-size 512 --hyper-clock-max-score 3
 
 ```
 
@@ -23,6 +26,7 @@ The default output is a readable table. Use `--format json` when another script 
 
 ```bash
 kvcache-simulator run \
+  --scheduler sequential \
   --trace trace.jsonl.gz \
   --model deepseek-v4-pro \
   --kv-precision fp8_int8 \
@@ -55,10 +59,13 @@ Required fields:
 - `input_length`: prefill input token count for this request.
 - `block_size`: source-native block size. It can be omitted only when `--block-size` is provided.
 
-Optional fields:
+Fields required only for recorded-time replay:
 
-- `timestamp`: arrival time in seconds for Sampled LRU; ignored by the existing five policies. Sort traces by arrival before replay.
-- `completion_timestamp` / `api_time`: Sampled LRU completion time / duration in seconds. See [Sampled LRU documentation](docs/SAMPLED_LRU.md).
+- `timestamp`: arrival time in seconds for recorded-time replay. Requests must follow chronological arrival order.
+- `completion_timestamp` / `api_time`: absolute completion time / duration in seconds for recorded-time replay.
+
+Other optional fields:
+
 - `output_length`: ignored by the hit-rate denominator. Generated output matters only if it appears later in another request's `hash_ids`.
 - `block_tokens`: advanced field for exact per-block token weights. If present, it must be a positive integer list with the same length as `hash_ids`.
 
@@ -87,7 +94,82 @@ Input and output support `.jsonl`, `.jsonl.gz`, and `-` for stdin/stdout. Summar
 
 Invalid records fail conversion with line/request context. File output is replaced atomically only on success, and temporary files are cleaned up on failure or interruption; stdout may contain partial output on failure. The converter accepts per-conversation `hash_id_scope: "local"` and requires consistent positive block sizes, nonempty conversation IDs/models/hash lists, positive input lengths, nonnegative output lengths, and finite nonnegative submission times and API durations.
 
-Scheduling uses recorded execution times to construct a workload; it does not predict timings for another model or server. The five existing policies ignore timestamps and process reads/writes in file order. Sampled LRU additionally models arrivals, in-flight execution, and completion-time writes. The simulator also loads the converted trace into memory; the converter's memory behavior does not change that.
+Recorded-time replay uses the converted timestamps without another conversion.
+These times describe the recorded workload.
+They do not predict execution times for another model or server.
+The simulator still loads the converted trace into memory.
+
+## Request schedulers
+
+Every `run` or `sweep` command requires `--scheduler recorded` or `--scheduler sequential`.
+There is no default scheduler.
+The selected scheduler controls every requested eviction policy and the hit-rate ceiling.
+Use the same scheduler when you compare policy results.
+
+| Behavior | `sequential` | `recorded` |
+| --- | --- | --- |
+| Request order | File order, with each completion immediately after its arrival. | Recorded arrival and completion times. |
+| Requests in flight | One request at a time. | Requests can overlap. |
+| Cache reads | At each arrival. | At each arrival. |
+| Cache writes | Immediately after that request's read. | At the recorded completion time. |
+| Timing fields | Not required. The scheduler ignores them. | Required for every request. |
+| Virtual clock | Always zero. | Jumps between event times without real-time waits. |
+| Backend | C++ supports all six policies. Python supports the five existing policies. | C++ supports all six policies. |
+
+Use sequential replay to compare eviction behavior with immediate cache writes.
+It preserves the original replay order for FIFO, LRU, LRU-FLAT, HYPER-CLOCK, and OPTIMAL.
+For example:
+
+```bash
+kvcache-simulator run \
+  --scheduler sequential \
+  --trace ~/ai_traces/mooncake_trace.jsonl \
+  --model glm-5.2 \
+  --kv-precision fp8_int8 \
+  --indexer-precision fp4_int4 \
+  --block-size 512
+```
+
+Use recorded-time replay to include concurrent requests and delayed cache writes.
+A request cannot read blocks that another request publishes after its arrival.
+For example:
+
+```bash
+kvcache-simulator run \
+  --scheduler recorded \
+  --trace ~/ai_traces/semianalysis_converted_concurrency_10.jsonl \
+  --model glm-5.2 \
+  --kv-precision fp8_int8 \
+  --indexer-precision fp4_int4 \
+  --hyper-clock-max-score 3
+```
+
+Recorded-time replay requires `timestamp` and at least one of `completion_timestamp` or `api_time`.
+All fields use seconds. Completion time is `timestamp + api_time` unless an absolute `completion_timestamp` supplies it.
+If both completion fields exist, their values must agree within one microsecond.
+Missing or invalid timing data stops the run, even when Sampled LRU is not selected.
+Sequential replay ignores missing or invalid timing data.
+
+At equal timestamps, previously admitted requests complete before new arrivals.
+The arrival batch keeps file order.
+New zero-duration requests complete after the entire arrival batch.
+Completion ties use conversation identifiers and request indices.
+See [timing and tie rules](docs/SAMPLED_LRU.md#clock-and-cache-access) for details.
+
+Sequential replay keeps every Sampled LRU timestamp at zero.
+A positive age threshold therefore reaches the threshold-halving fallback during eviction.
+A threshold of zero makes all sampled resident blocks eligible immediately.
+Use recorded-time replay when you need a threshold measured in seconds.
+
+The C++ backend constructs only the selected scheduler, once per invocation.
+All policies access that instance through `RequestScheduler::get()`.
+Each simulation resets its cursor before the next policy or cache capacity starts.
+The recorded sequence stays the same across cache capacities.
+HyperClock retains separate write offsets for requests in flight.
+OPTIMAL updates future-use priorities as arrivals occur.
+
+JSON reports the selection in `metadata.scheduler`, `metadata.replayModes`, and `metadata.ceilingReplayMode`.
+Python API calls to `run_sweep()` and `run_cpp_sweep()` also require `scheduler="recorded"` or `scheduler="sequential"`.
 
 ## Options
 
@@ -101,9 +183,10 @@ Scheduling uses recorded execution times to construct a workload; it does not pr
 | `--block-size N` | Fallback block size when trace records omit `block_size`; trace-declared `block_size` overrides it. |
 | `--estimate-tokens N` | Override the token count used for token-dependent bytes/token formulas. By default the trace average input length is used. |
 | `--budgets-gib A,B,C` | Comma-separated KV cache memory budgets in GiB. Default matches the web budget sweep: `1,2,4,...,16384`. |
-| `--policies fifo,lru,lru-flat,hyper-clock,optimal,sampled-lru` | Defaults to all six; Sampled LRU is skipped with a notice when timing is unavailable. |
+| `--policies fifo,lru,lru-flat,hyper-clock,optimal,sampled-lru` | C++ defaults to all six policies. Python defaults to the five existing policies. |
+| `--scheduler recorded\|sequential` | Required. Selects one scheduler for every policy and the ceiling. |
 | `--hyper-clock-max-score N` | Hyper Clock score limit; default `3`. Must be an integer in `1..2^64-1`. |
-| `--backend cpp\|python` | Simulation backend. Default is `cpp`; use `python` for debugging or machines without a compiler. |
+| `--backend cpp\|python` | Default is `cpp`. Python supports sequential replay for the five existing policies. |
 | `--jobs N` | Number of worker processes for the Python backend. The C++ backend runs one batch process and ignores this option. |
 | `--no-progress` | Disable terminal progress output. Progress is written to stderr only when stderr is interactive, so JSON stdout stays valid. |
 | `--format table\|json` | Output format. Default is `table`. |
@@ -129,10 +212,15 @@ With `max_score=1`, this is one-bit second-chance CLOCK. An entry with score `S`
 
 Deleted or evicted slots become holes without moving other entries. Clearing a slot does not reposition the hand; victim selection advances it as described above. Free indices go onto a stack: deleting slots `1` then `3` produces `[1,3]`; the next insertion pops and fills slot `3`. This allocation does not scan or age entries. Storage grows on demand up to the block capacity, and a full-cache insertion reuses its victim's slot.
 
+With recorded-time replay, HyperClock restores read hits that the cache evicts before completion.
+It then writes the suffix identified during that request's read.
+Surviving read hits receive no additional score update at completion.
+
 Run only Hyper Clock with either backend:
 
 ```bash
 kvcache-simulator run \
+  --scheduler sequential \
   --trace trace.jsonl.gz \
   --model qwen3-32b \
   --policies hyper-clock \
@@ -185,7 +273,8 @@ For an end-to-end example, use capacity `3`, maximum score `3`, and these four o
 
 ## Performance Notes
 
-The default C++ backend runs all cache-budget points in one batch after loading the trace and building the prefix trie once. This is usually faster than the Python backend, especially on large traces.
+The C++ backend loads the trace and builds the prefix trie once.
+It constructs the selected scheduler once and reuses it across all policies and cache capacities.
 
 After writing the binary trace files, the CLI releases Python's block ID, token weight, and request boundary lists before starting C++. It retains scalar metadata for output. Parsing still holds the full trace in memory before this handoff. Temporary files follow `TMPDIR` (normally `/tmp`); if that directory uses `tmpfs`, the files themselves consume memory.
 

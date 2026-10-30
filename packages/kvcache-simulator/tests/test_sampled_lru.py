@@ -125,7 +125,7 @@ class ReplayTests(unittest.TestCase):
 
     def test_defaults_skip_and_explicit_error(self):
         t = parse_trace_lines([json.dumps(dict(block_size=1, hash_ids=['A'], input_length=1))]*4)
-        args = dict(model_id='qwen3-32b', budgets_gib=[0.00025], backend='python')
+        args = dict(model_id='qwen3-32b', budgets_gib=[0.00025], backend='python', scheduler='sequential')
         r = run_sweep(t, **args)
         self.assertEqual(r['policies'], LEGACY)
         self.assertIn('sampled-lru', r['metadata']['skippedPolicies'])
@@ -134,21 +134,21 @@ class ReplayTests(unittest.TestCase):
     def test_legacy_results_and_budget_points_unchanged(self):
         t = trace([(0, 10, ['A']), (1, 10, ['B']), (2, 11, ['A']), (3, 12, ['B'])])
         for backend in ['python'] + (['cpp'] if shutil.which('c++') else []):
-            args = dict(model_id='qwen3-32b', budgets_gib=[0.00025], backend=backend)
+            args = dict(model_id='qwen3-32b', budgets_gib=[0.00025], backend=backend, scheduler='sequential')
             old = run_sweep(t, policies=LEGACY, **args)
             new = run_sweep(t, **args)
-            self.assertEqual(new['policies'], DEFAULT_POLICIES)
+            self.assertEqual(new['policies'], LEGACY if backend == 'python' else DEFAULT_POLICIES)
             self.assertEqual(len(old['points']), len(new['points']))
             for a,b in zip(old['points'], new['points']):
                 self.assertEqual(a['results'], {k:v for k,v in b['results'].items() if k in LEGACY})
-            self.assertIn('N/A', render_table(new))
+            self.assertEqual(new['metadata']['ceilingReplayMode'], 'sequential')
         changed = trace([(i*100, i*100+50, blocks) for i, blocks in enumerate([['A'],['B'],['A'],['B']])])
         for policy in LEGACY:
             self.assertEqual(simulate_policy(build_execution_plan(t), policy, 1), simulate_policy(build_execution_plan(changed), policy, 1))
 
     def test_parallel(self):
         t = trace([(i*2, i*2+1, ['A','B']) for i in range(8)])
-        kw = dict(model_id='qwen3-32b', budgets_gib=[0.00025], backend='python')
+        kw = dict(model_id='qwen3-32b', budgets_gib=[0.00025], backend='python', scheduler='sequential')
         self.assertEqual(run_sweep(t, jobs=1, **kw)['points'], run_sweep(t, jobs=2, **kw)['points'])
 
     def test_cli_default_selection_and_skip_notice(self):
@@ -157,11 +157,11 @@ class ReplayTests(unittest.TestCase):
             records = [dict(timestamp=i*2, api_time=1, hash_ids=['A'], input_length=1, block_size=1) for i in range(4)]
             path.write_text('\n'.join(json.dumps(r) for r in records))
             cmd = [sys.executable, '-m', 'kvcache_sim', 'run', '--trace', str(path), '--model', 'qwen3-32b',
-                   '--budgets-gib', '0.00025', '--backend', 'python', '--format', 'json']
+                   '--budgets-gib', '0.00025', '--backend', 'python', '--scheduler', 'sequential', '--format', 'json']
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             parsed = json.loads(result.stdout)
-            self.assertEqual(parsed['policies'], DEFAULT_POLICIES)
-            self.assertEqual(parsed['metadata']['sampledLruParameters']['thresholdSeconds'], 10)
+            self.assertEqual(parsed['policies'], LEGACY)
+            self.assertEqual(parsed['metadata']['scheduler'], 'sequential')
             for r in records: del r['timestamp']; del r['api_time']
             path.write_text('\n'.join(json.dumps(r) for r in records))
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -183,7 +183,7 @@ class NativeTests(unittest.TestCase):
         rng = random.Random(12)
         for iteration in range(12):
             t = trace([(i*20, i*20+1, [rng.randrange(3) for _ in range(rng.randint(1,4))]) for i in range(10)])
-            native = run_cpp_sweep(t, capacities=[0,1,3], policies=DEFAULT_POLICIES, warmup_requests=5)
+            native = run_cpp_sweep(t, scheduler="recorded", capacities=[0,1,3], policies=DEFAULT_POLICIES, warmup_requests=5)
             p = build_execution_plan(t)
             for cap in (0,1,3):
                 for policy in DEFAULT_POLICIES:
@@ -200,7 +200,7 @@ class NativeTests(unittest.TestCase):
             self.assertTrue(all(r() is None for r in refs))
             return original(*a, **kw)
         with patch('kvcache_sim.cpp_backend.subprocess.Popen', side_effect=launch):
-            run_cpp_sweep(t, capacities=[1], policies=['sampled-lru'], warmup_requests=2, release_trace_data=True)
+            run_cpp_sweep(t, scheduler="recorded", capacities=[1], policies=['sampled-lru'], warmup_requests=2, release_trace_data=True)
         self.assertEqual(t.ids, [])
 
     def test_native_batch_eviction_and_fallback(self):
@@ -236,14 +236,14 @@ int main() {
             t = trace(requests)
             t.completion_order = [1,0,2,3]
             expected = simulate_sampled(build_execution_plan(t), 1)
-            actual = run_cpp_sweep(t, capacities=[1], policies=['sampled-lru'], warmup_requests=2)
+            actual = run_cpp_sweep(t, scheduler="recorded", capacities=[1], policies=['sampled-lru'], warmup_requests=2)
             self.assertEqual(expected, actual.results['sampled-lru',1])
 
     def test_seed_reproducible_with_small_samples(self):
         t = trace([(i*2, i*2+1, [i%5, (i+1)%5]) for i in range(20)])
         kw = dict(capacities=[3], policies=['sampled-lru'], warmup_requests=10,
                   sampled_lru_threshold_seconds=0, sampled_lru_sample_size=2, sampled_lru_seed=123)
-        self.assertEqual(run_cpp_sweep(t, **kw), run_cpp_sweep(t, **kw))
+        self.assertEqual(run_cpp_sweep(t, scheduler="recorded", **kw), run_cpp_sweep(t, scheduler="recorded", **kw))
         p = build_execution_plan(t)
         self.assertEqual(simulate_sampled(p, 3, threshold=0, sample_size=2, seed=123),
                          simulate_sampled(p, 3, threshold=0, sample_size=2, seed=123))
@@ -252,7 +252,7 @@ int main() {
         t = trace([(0,1,['A']), (2,3,['A'])])
         with tempfile.TemporaryDirectory() as tmp:
             f = _write_binary_trace(t, Path(tmp))
-            cmd = [str(ensure_cpp_simulator()), '--policy','sampled-lru','--ids',str(f.ids),'--tokens',str(f.tokens),
+            cmd = [str(ensure_cpp_simulator()), '--scheduler','recorded','--policy','sampled-lru','--ids',str(f.ids),'--tokens',str(f.tokens),
                    '--request-ends',str(f.request_ends),'--request-count','2','--total-blocks','2','--capacity','1']
             self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode, 0)
             for flag,path in zip(('--request-arrivals','--request-completions','--request-order'), f.timing): cmd += [flag,str(path)]

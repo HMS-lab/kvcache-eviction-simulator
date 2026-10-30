@@ -63,7 +63,7 @@ class NativeTraceHandoffTests(unittest.TestCase):
             return original_popen(command, **kwargs)
 
         with patch("kvcache_sim.cpp_backend.subprocess.Popen", side_effect=checked_popen) as launch:
-            result = run_cpp_sweep(trace, capacities=[4], policies=["hyper-clock"],
+            result = run_cpp_sweep(trace, scheduler="sequential", capacities=[4], policies=["hyper-clock"],
                                    warmup_requests=2, release_trace_data=True)
         launch.assert_called_once()
         self.assertEqual(result.results[("hyper-clock", 4)], expected)
@@ -73,9 +73,9 @@ class NativeTraceHandoffTests(unittest.TestCase):
         trace = make_trace()
         kwargs = dict(model_id="qwen3-32b", precision="bf16_fp16", budgets_gib=[0.00025, 0.0005],
                       backend="cpp", policies=[p for p in DEFAULT_POLICIES if p != "sampled-lru"])
-        retained = run_sweep(trace, **kwargs)
+        retained = run_sweep(trace, scheduler="sequential", **kwargs)
         self.assertEqual(len(trace.ids), 80)
-        consumed = run_sweep(trace, **kwargs, release_trace_data=True)
+        consumed = run_sweep(trace, scheduler="sequential", **kwargs, release_trace_data=True)
         self.assertEqual(consumed, retained)
         self.assertEqual(consumed["metadata"]["eventCount"], 80)
         self.assertEqual((trace.ids, trace.tokens, trace.request_starts), ([], [], []))
@@ -85,7 +85,7 @@ class NativeTraceHandoffTests(unittest.TestCase):
         binary = ensure_cpp_simulator()
         with tempfile.TemporaryDirectory() as directory:
             files = _write_binary_trace(trace, Path(directory))
-            base = [str(binary), "--policy", "hyper-clock", "--ids", str(files.ids),
+            base = [str(binary), "--scheduler", "sequential", "--policy", "hyper-clock", "--ids", str(files.ids),
                     "--tokens", str(files.tokens), "--request-ends", str(files.request_ends),
                     "--request-count", "4", "--capacity", "4"]
             cases = [

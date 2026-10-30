@@ -87,6 +87,7 @@ def run_sweep(
     trace: TraceData,
     *,
     model_id: str,
+    scheduler: str,
     precision: str | None = None,
     indexer_precision: str | None = None,
     budgets_gib: list[float] | None = None,
@@ -106,6 +107,13 @@ def run_sweep(
 ) -> dict[str, Any]:
     """Simulate budgets; release_trace_data consumes event lists on the C++ backend."""
     validate_hyper_clock_max_score(hyper_clock_max_score)
+    if scheduler not in {"recorded", "sequential"}:
+        raise ValueError(f"Unsupported scheduler: {scheduler}")
+    if backend == "python" and scheduler == "recorded":
+        raise ValueError("recorded scheduling requires the C++ backend")
+    if scheduler == "recorded" and any(values is None or len(values) != trace.request_count for values in
+                                       (trace.arrivals, trace.completions, trace.completion_order)):
+        raise ValueError(f"recorded scheduler: {trace.timing_error or 'Complete request timing data is required'}")
     event_count = len(trace.ids)
     data = models_data or load_models_data()
     models = models_by_id(data)
@@ -135,9 +143,8 @@ def run_sweep(
     skipped = {}
     if "sampled-lru" in selected_policies:
         validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size, sampled_lru_seed)
-        if any(values is None or len(values) != trace.request_count for values in
-               (trace.arrivals, trace.completions, trace.completion_order)):
-            reason = trace.timing_error or "Complete request timing data is required"
+        if backend == "python":
+            reason = "sampled-lru with sequential scheduling requires the C++ backend"
             if policies:
                 raise ValueError(f"sampled-lru: {reason}")
             skipped["sampled-lru"] = reason
@@ -164,6 +171,7 @@ def run_sweep(
             capacities=cpp_capacities,
             policies=selected_policies,
             warmup_requests=warmup_requests,
+            scheduler=scheduler,
             hyper_clock_max_score=hyper_clock_max_score,
             **sampled,
             release_trace_data=release_trace_data,
@@ -220,8 +228,9 @@ def run_sweep(
         "metadata": {
             **({"policyParameters": {"hyper-clock": {"maxScore": hyper_clock_max_score}}} if "hyper-clock" in selected_policies else {}),
             "skippedPolicies": skipped,
-            "replayModes": {p: "recorded" if p == "sampled-lru" else "sequential" for p in selected_policies},
-            "ceilingReplayMode": "sequential",
+            "scheduler": scheduler,
+            "replayModes": {p: scheduler for p in selected_policies},
+            "ceilingReplayMode": scheduler,
             **({"sampledLruParameters": {"thresholdSeconds": sampled_lru_threshold_seconds,
                 "sampleSize": sampled_lru_sample_size, "seed": sampled_lru_seed}} if "sampled-lru" in selected_policies else {}),
             "modelId": cache_size.model_id,

@@ -392,7 +392,7 @@ int main() {
         for trace in traces:
             for warmup_fraction in (0, 0.5, 1):
                 plan = build_execution_plan(trace, warmup_fraction)
-                native = run_cpp_sweep(trace, capacities=[0, 1, 2, 4, 100], policies=["lru-flat"], warmup_requests=plan.warmup_requests)
+                native = run_cpp_sweep(trace, scheduler="sequential", capacities=[0, 1, 2, 4, 100], policies=["lru-flat"], warmup_requests=plan.warmup_requests)
                 for capacity in (0, 1, 2, 4, 100):
                     with self.subTest(events=len(trace.ids), warmup=warmup_fraction, capacity=capacity):
                         self.assertEqual(native.results[("lru-flat", capacity)], simulate_policy(plan, "lru-flat", capacity))
@@ -403,7 +403,7 @@ int main() {
         binary = ensure_cpp_simulator()
         with tempfile.TemporaryDirectory() as tmpdir:
             files = _write_binary_trace(trace, Path(tmpdir))
-            base = [str(binary), "--ids", str(files.ids), "--tokens", str(files.tokens),
+            base = [str(binary), "--scheduler", "sequential", "--ids", str(files.ids), "--tokens", str(files.tokens),
                     "--request-ends", str(files.request_ends), "--request-count", "4",
                     "--total-blocks", str(len(trace.ids)), "--warmup-requests", "2", "--capacity", "2"]
             def run(*args):
@@ -415,7 +415,7 @@ int main() {
         self.assertEqual(single["hitTokens"], 2)
         self.assertEqual(all_results["lru-flat"]["hitTokens"], 2)
         self.assertEqual(set(batch["points"][0]), {"cacheBlocks", "lru-flat"})
-        self.assertEqual(set(default_batch["points"][0]), {"cacheBlocks", "fifo", "lru", "lru-flat", "hyper-clock", "optimal"})
+        self.assertEqual(set(default_batch["points"][0]), {"cacheBlocks", "fifo", "lru", "lru-flat", "hyper-clock", "optimal", "sampled-lru"})
 
 
 class SweepAndCliTests(unittest.TestCase):
@@ -427,6 +427,7 @@ class SweepAndCliTests(unittest.TestCase):
         trace = make_trace(["A"], ["A"], ["B"], ["C"])
         result = run_sweep(
             trace,
+            scheduler="sequential",
             model_id="qwen3-32b",
             precision="bf16_fp16",
             budgets_gib=[0.00025, 0.0005, 0.001],
@@ -444,6 +445,7 @@ class SweepAndCliTests(unittest.TestCase):
         trace = make_trace(["A"], ["B"], ["A"], ["B"])
         result = run_sweep(
             trace,
+            scheduler="sequential",
             model_id="qwen3-32b",
             precision="bf16_fp16",
             budgets_gib=[0.001, 0.00025, 0.00025],
@@ -459,6 +461,7 @@ class SweepAndCliTests(unittest.TestCase):
         trace = make_trace(["A"], ["B"], ["A"], ["B"])
         serial = run_sweep(
             trace,
+            scheduler="sequential",
             model_id="qwen3-32b",
             precision="bf16_fp16",
             budgets_gib=[0.00025],
@@ -468,6 +471,7 @@ class SweepAndCliTests(unittest.TestCase):
         )
         parallel = run_sweep(
             trace,
+            scheduler="sequential",
             model_id="qwen3-32b",
             precision="bf16_fp16",
             budgets_gib=[0.00025],
@@ -484,6 +488,8 @@ class SweepAndCliTests(unittest.TestCase):
         trace = make_trace(["A"], ["B"], ["A"], ["B"])
         python_result = run_sweep(
             trace,
+            scheduler="sequential",
+            policies=["fifo", "lru", "lru-flat", "hyper-clock", "optimal"],
             model_id="qwen3-32b",
             precision="bf16_fp16",
             budgets_gib=[0.00025],
@@ -493,6 +499,8 @@ class SweepAndCliTests(unittest.TestCase):
         )
         cpp_result = run_sweep(
             trace,
+            scheduler="sequential",
+            policies=["fifo", "lru", "lru-flat", "hyper-clock", "optimal"],
             model_id="qwen3-32b",
             precision="bf16_fp16",
             budgets_gib=[0.00025],
@@ -522,7 +530,8 @@ class SweepAndCliTests(unittest.TestCase):
                 "-m",
                 "kvcache_sim",
                 "sweep",
-                "--trace",
+                "--policies", "fifo,lru,lru-flat,hyper-clock,optimal",
+                "--scheduler", "sequential", "--trace",
                 str(trace_path),
                 "--model",
                 "qwen3-32b",
@@ -574,7 +583,7 @@ class SweepAndCliTests(unittest.TestCase):
                 encoding="utf-8",
             )
             args = [
-                "--trace",
+                "--scheduler", "sequential", "--trace",
                 str(trace_path),
                 "--model",
                 "qwen3-32b",

@@ -70,7 +70,7 @@ def _write_array(path: Path, typecode: str, values: Iterable[int]) -> None:
         data.tofile(handle)
 
 
-def _write_binary_trace(trace: TraceData, directory: Path) -> _BinaryTraceFiles:
+def _write_binary_trace(trace: TraceData, directory: Path, *, include_timing: bool = True) -> _BinaryTraceFiles:
     if len(trace.ids) > UINT32_MAX:
         raise ValueError("C++ backend supports at most 2^32 - 1 trace blocks")
     if trace.request_starts[-1] > UINT32_MAX:
@@ -88,7 +88,7 @@ def _write_binary_trace(trace: TraceData, directory: Path) -> _BinaryTraceFiles:
     _write_array(request_ends_path, "I", trace.request_starts[1:])
 
     timing = ()
-    if trace.arrivals is not None:
+    if include_timing and trace.arrivals is not None:
         timing = tuple(directory / name for name in ("arrivals.u64", "completions.u64", "order.u32"))
         for path, code, values in zip(timing, ("Q", "Q", "I"), (trace.arrivals, trace.completions, trace.completion_order)):
             if values is None or len(values) != trace.request_count:
@@ -143,6 +143,7 @@ def run_cpp_sweep(
     capacities: list[int],
     policies: list[str],
     warmup_requests: int,
+    scheduler: str,
     hyper_clock_max_score: int = 3,
     sampled_lru_threshold_seconds: float = 10.0,
     sampled_lru_sample_size: int = 16,
@@ -152,10 +153,13 @@ def run_cpp_sweep(
 ) -> CppSweepResult:
     """Run native replay; optionally consume the trace's event lists after writing."""
     validate_hyper_clock_max_score(hyper_clock_max_score)
+    if scheduler not in {"recorded", "sequential"}:
+        raise ValueError(f"Unsupported scheduler: {scheduler}")
     threshold_us = (validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size, sampled_lru_seed)
                     if "sampled-lru" in policies else 10_000_000)
-    if "sampled-lru" in policies and trace.arrivals is None:
-        raise ValueError("sampled-lru requires request timing data")
+    if scheduler == "recorded" and any(values is None or len(values) != trace.request_count for values in
+                                       (trace.arrivals, trace.completions, trace.completion_order)):
+        raise ValueError("recorded scheduler requires complete request timing data")
     event_count = len(trace.ids)
     binary = ensure_cpp_simulator(progress)
     safe_capacities = []
@@ -170,7 +174,7 @@ def run_cpp_sweep(
     with tempfile.TemporaryDirectory(prefix="kvcache-sim-cpp-") as tmpdir:
         if progress:
             progress(0, max(1, len(safe_capacities) + 2), "writing binary trace")
-        files = _write_binary_trace(trace, Path(tmpdir))
+        files = _write_binary_trace(trace, Path(tmpdir), include_timing=scheduler == "recorded")
         if release_trace_data:
             # Keep scalar metadata, but drop the large lists before C++ loads
             # its own arrays. Reassignment also keeps TraceData's field types.
@@ -182,6 +186,8 @@ def run_cpp_sweep(
             str(binary),
             "--policy",
             "batch",
+            "--scheduler",
+            scheduler,
             "--ids",
             str(files.ids),
             "--tokens",
@@ -201,9 +207,10 @@ def run_cpp_sweep(
             "--policies",
             ",".join(policies),
         ]
-        if "sampled-lru" in policies:
+        if scheduler == "recorded":
             for flag, path in zip(("--request-arrivals", "--request-completions", "--request-order"), files.timing):
                 command.extend((flag, str(path)))
+        if "sampled-lru" in policies:
             command.extend(("--sampled-lru-threshold-us", str(threshold_us),
                             "--sampled-lru-sample-size", str(sampled_lru_sample_size),
                             "--sampled-lru-seed", str(sampled_lru_seed)))

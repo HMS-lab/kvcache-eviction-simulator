@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <iostream>
 #include <list>
+#include <memory>
 #include <queue>
 #include <random>
 #include <tuple>
@@ -25,6 +26,7 @@ constexpr std::size_t kChunkEvents = 1'000'000;
 
 struct Options {
   std::string policy;
+  std::string scheduler;
   std::string ids_path;
   std::string tokens_path;
   std::string next_path;
@@ -118,6 +120,7 @@ Options parse_args(int argc, char** argv) {
       return argv[++index];
     };
     if (arg == "--policy") options.policy = require_value(arg);
+    else if (arg == "--scheduler") options.scheduler = require_value(arg);
     else if (arg == "--ids") options.ids_path = require_value(arg);
     else if (arg == "--tokens") options.tokens_path = require_value(arg);
     else if (arg == "--next") options.next_path = require_value(arg);
@@ -144,10 +147,13 @@ Options parse_args(int argc, char** argv) {
     else throw std::runtime_error("Unknown argument: " + arg);
   }
   if (options.policy.empty() || options.ids_path.empty() || options.tokens_path.empty() || options.total_blocks == 0) {
-    throw std::runtime_error("Usage: kv-cache-lab-native-sim --policy fifo|lru|lru-flat|hyper-clock|optimal|sampled-lru|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--hyper-clock-max-score N] [--next PATH]");
+    throw std::runtime_error("Usage: kv-cache-lab-native-sim --scheduler recorded|sequential --policy fifo|lru|lru-flat|hyper-clock|optimal|sampled-lru|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--hyper-clock-max-score N] [--next PATH]");
   }
   if (options.policy != "build-next" && (options.request_ends_path.empty() || options.request_count == 0)) {
     throw std::runtime_error("--request-ends and --request-count are required");
+  }
+  if (options.policy != "build-next" && options.scheduler != "sequential" && options.scheduler != "recorded") {
+    throw std::runtime_error("Select --scheduler sequential or --scheduler recorded");
   }
   return options;
 }
@@ -271,7 +277,7 @@ struct ScheduledEvent {
 
 class RequestScheduler {
  public:
-  virtual ~RequestScheduler() { if (instance_ == this) instance_ = nullptr; }
+  virtual ~RequestScheduler() { instance_ = nullptr; }
   RequestScheduler(const RequestScheduler&) = delete;
   RequestScheduler& operator=(const RequestScheduler&) = delete;
 
@@ -279,11 +285,6 @@ class RequestScheduler {
     assert(instance_);
     assert(instance_->at_start());
     return *instance_;
-  }
-  static void activate(RequestScheduler& scheduler) {
-    assert(!instance_ || instance_->at_start());
-    assert(scheduler.at_start());
-    instance_ = &scheduler;
   }
   virtual std::optional<ScheduledEvent> next_event() = 0;
   virtual bool exhausted() const = 0;
@@ -295,11 +296,9 @@ class RequestScheduler {
   }
 
  protected:
-  explicit RequestScheduler(bool register_instance = true) {
-    if (register_instance) {
-      assert(!instance_);
-      instance_ = this;
-    }
+  RequestScheduler() {
+    assert(!instance_);
+    instance_ = this;
   }
   virtual bool at_start() const = 0;
   virtual void reset_impl() = 0;
@@ -311,8 +310,8 @@ class RequestScheduler {
 // Generate adjacent read/write events without storing a timeline. Timestamps are unused.
 class SequentialRequestScheduler final : public RequestScheduler {
  public:
-  explicit SequentialRequestScheduler(std::uint32_t request_count, bool register_instance = true)
-      : RequestScheduler(register_instance), event_count_(2ULL * request_count) {}
+  explicit SequentialRequestScheduler(std::uint32_t request_count)
+      : event_count_(2ULL * request_count) {}
 
   std::optional<ScheduledEvent> next_event() override {
     if (exhausted()) return std::nullopt;
@@ -460,11 +459,14 @@ std::vector<T> load_timing(const std::string& path, std::size_t count) {
 }
 
 SimulationInput load_simulation_input(const Options& options) {
+  if (options.scheduler == "recorded" && (options.arrivals_path.empty()
+      || options.completions_path.empty() || options.order_path.empty()))
+    throw std::runtime_error("recorded scheduler requires complete request timing data");
   SimulationInput input;
   input.ids = load_ids_all(options);
   input.tokens = load_tokens_all(options);
   input.request_ends = load_request_ends(options);
-  if (!options.arrivals_path.empty() || !options.completions_path.empty() || !options.order_path.empty()) {
+  if (options.scheduler == "recorded") {
     input.arrivals = load_timing<std::uint64_t>(options.arrivals_path, options.request_count);
     input.completions = load_timing<std::uint64_t>(options.completions_path, options.request_count);
     input.completion_order = load_timing<std::uint32_t>(options.order_path, options.request_count);
@@ -788,7 +790,7 @@ Result simulate_hyper_clock(const SimulationInput& input, std::uint32_t capacity
   HyperClockCache cache(capacity, options.hyper_clock_max_score);
   bool full_before_measurement = false;
   auto& scheduler = RequestScheduler::get();
-  std::uint64_t write_start = 0;
+  std::unordered_map<std::uint32_t, std::uint64_t> write_starts;
   while (const auto event = scheduler.next_event()) {
     const auto request = event->request;
     const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
@@ -804,8 +806,15 @@ Result simulate_hyper_clock(const SimulationInput& input, std::uint32_t capacity
         result.hit_tokens += read.hit_tokens;
         for (auto index = start; index < end; ++index) result.total_tokens += input.tokens[index];
       }
-      write_start = read.write_start;
+      write_starts.emplace(request, read.write_start);
     } else {
+      const auto write_start = write_starts.at(request);
+      write_starts.erase(request);
+      // Restore read hits evicted in flight without refreshing surviving hits twice.
+      for (auto index = start; index < write_start; ++index) {
+        const auto node = input.prefix.node_for_event[index];
+        if (!cache.contains(node)) cache.write(node);
+      }
       write_hyper_clock_suffix(cache, input, write_start, end);
       if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
     }
@@ -879,6 +888,8 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
   std::vector<std::uint32_t> state_version(node_count, 0);
   std::vector<std::uint32_t> state_key(node_count, 0);
   std::vector<std::uint32_t> protected_mark(node_count, 0);
+  std::vector<std::uint32_t> next_use;
+  if (optimal) next_use.assign(node_count, static_cast<std::uint32_t>(input.request_ends.size() + 1ULL));
   BinaryHeap heap(optimal);
   present[0] = 1;
   std::uint32_t cache_size = 0;
@@ -904,12 +915,12 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
     push_leaf(node);
   };
 
-  auto add_node = [&](std::uint32_t node, std::uint64_t event_index) {
+  auto add_node = [&](std::uint32_t node) {
     const std::uint32_t parent = input.prefix.parent[node];
     present[node] = 1;
     cache_size += 1;
     child_count[parent] += 1;
-    if (optimal) update_optimal(node, input.prefix.next_request_for_event[event_index]);
+    if (optimal) update_optimal(node, next_use[node]);
     else touch_lru(node);
   };
 
@@ -968,6 +979,11 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
         scheduler.reset();
         return underfilled_result(input, options);
       }
+      if (optimal) {
+        for (auto index = start; index < end; ++index) {
+          next_use[input.prefix.node_for_event[index]] = input.prefix.next_request_for_event[index];
+        }
+      }
       const bool measured = request >= options.warmup_requests;
       bool prefix_alive = true;
       for (std::uint64_t index = start; index < end; index += 1) {
@@ -978,7 +994,7 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
           if (prefix_alive && hit) result.hit_tokens += input.tokens[index];
         }
         if (prefix_alive && hit) {
-          if (optimal) update_optimal(node, input.prefix.next_request_for_event[index]);
+          if (optimal) update_optimal(node, next_use[node]);
           else touch_lru(node);
         } else if (!hit) {
           prefix_alive = false;
@@ -990,11 +1006,11 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
         const std::uint32_t node = input.prefix.node_for_event[index];
         if (present[node]) continue;
         if (cache_size >= capacity) {
-          const std::uint32_t candidate_key = optimal ? input.prefix.next_request_for_event[index] : 0;
+          const std::uint32_t candidate_key = optimal ? next_use[node] : 0;
           if (!evict_leaf(candidate_key)) break;
         }
         if (cache_size < capacity && present[input.prefix.parent[node]]) {
-          add_node(node, index);
+          add_node(node);
           if (cache_size >= capacity && request < options.warmup_requests) full_before_measurement = true;
         } else {
           break;
@@ -1059,7 +1075,6 @@ struct SampledCache {
 };
 
 Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, const Options& options) {
-  if (!input.timing_available) throw std::runtime_error("sampled-lru requires complete request timing data");
   auto& scheduler = RequestScheduler::get();
   if (!capacity) {
     scheduler.discard_remaining();
@@ -1143,7 +1158,7 @@ void print_named_result(const char* policy, std::uint64_t cache_blocks, const Re
             << "\"usefulCacheRate\":" << std::setprecision(17) << result.useful_cache_rate(cache_blocks);
 }
 
-void print_all_results(std::uint64_t cache_blocks, const AllResults& results, std::uint64_t trie_node_count, std::uint64_t warmup_requests, bool timing = false) {
+void print_all_results(std::uint64_t cache_blocks, const AllResults& results, std::uint64_t trie_node_count, std::uint64_t warmup_requests) {
   std::cout << "{"
             << "\"cacheBlocks\":" << cache_blocks << ","
             << "\"trieNodeCount\":" << trie_node_count << ","
@@ -1158,29 +1173,30 @@ void print_all_results(std::uint64_t cache_blocks, const AllResults& results, st
   std::cout << "},\"optimal\":{";
   print_named_result("optimal", cache_blocks, results.optimal, warmup_requests);
   std::cout << "}";
-  if (timing) {
-    std::cout << ",\"sampled-lru\":{";
-    print_named_result("sampled-lru", cache_blocks, results.sampled, warmup_requests);
-    std::cout << "}";
-  }
+  std::cout << ",\"sampled-lru\":{";
+  print_named_result("sampled-lru", cache_blocks, results.sampled, warmup_requests);
+  std::cout << "}";
   std::cout << "}\n";
 }
 
-// The owner fixes each policy's scheduler; policies only consume the active interface.
+// Construct one selected scheduler for the entire run. Policies use its singleton accessor.
+std::unique_ptr<RequestScheduler> make_scheduler(const SimulationInput& input, const Options& options) {
+  if (options.scheduler == "sequential")
+    return std::make_unique<SequentialRequestScheduler>(input.request_ends.size());
+  if (options.scheduler == "recorded") {
+    if (!input.timing_available) throw std::runtime_error("recorded scheduler requires complete request timing data");
+    return std::make_unique<RecordedTimeScheduler>(input.arrivals, input.completions, input.completion_order);
+  }
+  throw std::runtime_error("Select --scheduler sequential or --scheduler recorded");
+}
+
 class SimulationRunner {
  public:
-  SimulationRunner(const SimulationInput& input, const Options& options, bool run_sampled)
-      : input(input), options(options), sequential(input.request_ends.size(), false) {
-    if (run_sampled) recorded.emplace(input.arrivals, input.completions, input.completion_order);
-  }
+  SimulationRunner(const SimulationInput& input, const Options& options)
+      : input(input), options(options), scheduler(make_scheduler(input, options)) {}
 
   Result run(const std::string& policy, std::uint32_t capacity) {
-    if (policy == "sampled-lru") {
-      assert(recorded);
-      RequestScheduler::activate(*recorded);
-      return simulate_sampled(input, capacity, options);
-    }
-    RequestScheduler::activate(sequential);
+    if (policy == "sampled-lru") return simulate_sampled(input, capacity, options);
     if (policy == "ceiling") return simulate_ceiling(input, options);
     if (policy == "fifo") return simulate_fifo(input, capacity, options);
     if (policy == "lru") return simulate_trie_policy(input, capacity, false, options);
@@ -1194,7 +1210,7 @@ class SimulationRunner {
     return {
       run("fifo", capacity), run("lru", capacity), run("lru-flat", capacity),
       run("hyper-clock", capacity), run("optimal", capacity),
-      input.timing_available ? run("sampled-lru", capacity) : Result{},
+      run("sampled-lru", capacity),
     };
   }
 
@@ -1223,7 +1239,7 @@ class SimulationRunner {
       Result hyper_clock;
       Result optimal;
       Result sampled;
-      const bool run_sampled = has_policy(options, "sampled-lru") && input.timing_available;
+      const bool run_sampled = has_policy(options, "sampled-lru");
       if (run_sampled) sampled = run("sampled-lru", capacity);
       if (has_policy(options, "fifo")) fifo = run("fifo", capacity);
       if (has_policy(options, "lru")) lru = run("lru", capacity);
@@ -1276,8 +1292,7 @@ class SimulationRunner {
  private:
   const SimulationInput& input;
   const Options& options;
-  SequentialRequestScheduler sequential;
-  std::optional<RecordedTimeScheduler> recorded;
+  std::unique_ptr<RequestScheduler> scheduler;
 };
 
 }  // namespace
@@ -1293,16 +1308,10 @@ int main(int argc, char** argv) {
 
     report_progress(options, 0, 1 + options.capacities.size(), "load");
     const SimulationInput input = load_simulation_input(options);
-    const bool requested_sampled = options.policy == "sampled-lru" || std::find(options.policies.begin(), options.policies.end(), "sampled-lru") != options.policies.end();
-    if (requested_sampled && !input.timing_available) throw std::runtime_error("sampled-lru requires complete request timing data");
-    if (!input.timing_available && !requested_sampled && (options.policy == "all" || (options.policy == "batch" && options.policies.empty())))
-      std::cerr << "Skipping sampled-lru: request timing data unavailable\n";
-    const bool run_sampled = input.timing_available && (options.policy == "sampled-lru"
-      || options.policy == "all" || (options.policy == "batch" && has_policy(options, "sampled-lru")));
-    SimulationRunner runner(input, options, run_sampled);
+    SimulationRunner runner(input, options);
     const std::uint64_t trie_node_count = input.prefix.parent.size();
     if (options.policy == "batch") runner.print_batch_results();
-    else if (options.policy == "all") print_all_results(options.capacity, runner.simulate_all(options.capacity), trie_node_count, options.warmup_requests, input.timing_available);
+    else if (options.policy == "all") print_all_results(options.capacity, runner.simulate_all(options.capacity), trie_node_count, options.warmup_requests);
     else print_result(options.policy, options.capacity, runner.run(options.policy, options.capacity), trie_node_count, options.warmup_requests);
     return 0;
   } catch (const std::exception& error) {
