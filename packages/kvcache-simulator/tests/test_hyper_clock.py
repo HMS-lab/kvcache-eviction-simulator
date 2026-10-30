@@ -83,7 +83,6 @@ class HyperClockTests(unittest.TestCase):
         for position in example["cached_positions"]:
             node = plan.node_for_event[position]
             cache.write(node)
-            cache.slots[cache.entries[node]].score = example["cached_score"]
         read = _read_hyper_clock_prefix(cache, plan, 0, len(plan.ids))
         self.assertEqual(read, (example["hit_tokens"], example["write_start"]))
         self.assertEqual(scores_for(cache, plan.node_for_event), example["scores_after_read"])
@@ -113,7 +112,7 @@ class HyperClockTests(unittest.TestCase):
         self.assertEqual(cache.free_slots, [1])
         self.assertFalse(cache.lookup(999))
         self.assertEqual(cache.hand, 2)
-        self.assertEqual(scores_for(cache, [1, 3, 5]), [1, 3, 3])
+        self.assertEqual(scores_for(cache, [1, 3, 5]), [1, 3, 1])
         self.assertEqual(len(cache.slots), 4)
 
     def test_sparse_wraparound_and_persistent_hand(self):
@@ -136,25 +135,25 @@ class HyperClockTests(unittest.TestCase):
             self.assertEqual(scores_for(cache, [1]), [limit])
             self.assertEqual((len(cache), len(cache.slots), cache.hand), (1, 1, 0))
 
-    def test_new_entries_start_saturated_in_fresh_and_reused_slots(self):
+    def test_new_entries_start_at_one_in_fresh_and_reused_slots(self):
         for limit in (1, 3, 7, 300, 2**64 - 1):
             with self.subTest(max_score=limit):
                 cache = _HyperClockCache(2, limit)
                 cache.write(1)
                 cache.write(2)
-                self.assertEqual(scores_for(cache, [1, 2]), [limit, limit])
+                self.assertEqual(scores_for(cache, [1, 2]), [1, 1])
                 self.assertEqual(cache.hand, 0)
                 cache.discard(1)
                 cache.write(3)
-                self.assertEqual(scores_for(cache, [3, 2]), [limit, limit])
+                self.assertEqual(scores_for(cache, [3, 2]), [1, 1])
                 cache.discard(3)
                 cache.write(1)
-                self.assertEqual(scores_for(cache, [1, 2]), [limit, limit])
-                # Eviction reuses its victim's slot with a saturated counter.
+                self.assertEqual(scores_for(cache, [1, 2]), [1, 1])
+                # Eviction reuses its victim's slot with score one.
                 cache.slots[cache.entries[1]].score = 0
                 cache.write(4)
                 self.assertNotIn(1, cache)
-                self.assertEqual(scores_for(cache, [4, 2]), [limit, limit])
+                self.assertEqual(scores_for(cache, [4, 2]), [1, 1])
                 self.assertEqual(cache.hand, 1)
 
     def test_existing_write_increments_aged_score_without_resetting_it(self):
@@ -244,7 +243,7 @@ class HyperClockTests(unittest.TestCase):
         self.assertEqual(_read_hyper_clock_prefix(cache, plan, 2, 4), (1, 3))
         self.assertEqual(scores_for(cache, [ac]), [1])
         _write_hyper_clock_suffix(cache, plan, 3, 4)
-        self.assertEqual(scores_for(cache, [ac, bc]), [1, 3])
+        self.assertEqual(scores_for(cache, [ac, bc]), [1, 1])
 
     def test_boundaries_weighted_tokens_and_validation(self):
         trace = parse_trace_lines([
@@ -391,7 +390,6 @@ int main() {
         for position in example["cached_positions"]:
             node = plan.node_for_event[position]
             cache.write(node)
-            cache.slots[cache.entries[node]].score = example["cached_score"]
         end = len(plan.ids)
         states = self.native_operations(cache, [(4, 0, end), (5, example["write_start"], end),
                                                (4, 0, end), (5, end, end)], plan)
@@ -429,18 +427,18 @@ int main() {
                     expected.append(snapshot(cache, result))
             self.assertEqual(self.native_operations(initial, operations), expected)
 
-    def test_native_insertions_and_reinsertions_start_saturated(self):
+    def test_native_insertions_and_reinsertions_start_at_one(self):
         for limit in (1, 3, 7, 300, 2**64 - 1):
             with self.subTest(max_score=limit):
                 states = self.native_operations(_HyperClockCache(2, limit),
                                                 [(0, 1), (0, 2), (2, 1), (0, 3), (2, 3), (0, 1)])
-                self.assertEqual(states[0]["slots"], [[1, limit]])
-                self.assertEqual(states[1]["slots"], [[1, limit], [2, limit]])
-                self.assertEqual(states[3]["slots"], [[3, limit], [2, limit]])
-                self.assertEqual(states[5]["slots"], [[1, limit], [2, limit]])
+                self.assertEqual(states[0]["slots"], [[1, 1]])
+                self.assertEqual(states[1]["slots"], [[1, 1], [2, 1]])
+                self.assertEqual(states[3]["slots"], [[3, 1], [2, 1]])
+                self.assertEqual(states[5]["slots"], [[1, 1], [2, 1]])
                 self.assertTrue(all(state["hand"] == 0 for state in states))
                 state = self.native_operations(seed_scores([0, limit], max_score=limit), [(0, 3)])[0]
-                self.assertEqual(state["slots"], [[3, limit], [2, limit]])
+                self.assertEqual(state["slots"], [[3, 1], [2, limit]])
                 self.assertEqual(state["hand"], 1)
         state = self.native_operations(seed_scores([0], max_score=7), [(0, 1)])[0]
         self.assertEqual(state["slots"], [[1, 1]])
