@@ -63,6 +63,36 @@ class CacheTests(unittest.TestCase):
             c.write(5, 20); c.write(6, 20)
         self.assertEqual(len(c.entries), 4)
 
+    def test_eviction_limit_selects_oldest_qualifying_sampled_blocks(self):
+        for limit in (1, 2, 3, 10, None):
+            with self.subTest(limit=limit):
+                c = SampledCache(5, 10, 5, 0, max_evictions=limit)
+                for node in range(1, 6): c.write(node, 0)
+                c.lookup(1, 5)  # Oldest eligible order is 2, 3, 1.
+                c.lookup(4, 10)  # Age equals threshold: excluded.
+                c.lookup(5, 20)
+                with patch.object(c.rng, 'sample', return_value=[4, 0, 2, 3, 1]):
+                    c.write(6, 20)
+                count = min(limit if limit is not None else 3, 3)
+                self.assertEqual(set(c.entries), set(range(1, 7)) - set([2, 3, 1][:count]))
+                self.assertEqual(len(c.free), count - 1)
+
+    def test_eviction_limit_applies_to_selected_sample_only(self):
+        c = SampledCache(3, 10, 1, 0, max_evictions=1)
+        for node in range(1, 4): c.write(node, node)
+        with patch.object(c.rng, 'sample', return_value=[2]):
+            c.write(4, 20)
+        self.assertEqual(set(c.entries), {1, 2, 4})
+
+    def test_limited_eviction_preserves_fallback_and_zero_threshold(self):
+        c = SampledCache(2, 10, 2, 0, max_evictions=1)
+        c.write(1, 0); c.write(2, 0); c.write(3, 0)
+        self.assertEqual(set(c.entries), {2, 3})
+        self.assertEqual(c.threshold, 10)
+        z = SampledCache(2, 0, 2, 0, max_evictions=1)
+        z.write(1, 0); z.write(2, 0); z.write(3, 0)
+        self.assertEqual(set(z.entries), {2, 3})
+
     def test_controlled_sample_and_scan(self):
         c = SampledCache(3, 10, 1, 0)
         for n in range(3): c.write(n, 0)
@@ -172,7 +202,8 @@ class ReplayTests(unittest.TestCase):
     def test_parameter_validation(self):
         p = build_execution_plan(trace([(0,1,['A']), (2,3,['A'])]))
         for kw in [dict(threshold=-1), dict(threshold=float('inf')), dict(threshold=10**500),
-                   dict(sample_size=0), dict(sample_size=True), dict(seed=-1), dict(seed=2**64)]:
+                   dict(sample_size=0), dict(sample_size=True), dict(seed=-1), dict(seed=2**64),
+                   *[dict(max_evictions=v) for v in (0, -1, True, 1.5, 2**32)]]:
             with self.assertRaises(ValueError): simulate_sampled(p, 1, **kw)
 
 
@@ -188,6 +219,44 @@ class NativeTests(unittest.TestCase):
             for cap in (0,1,3):
                 for policy in DEFAULT_POLICIES:
                     self.assertEqual(native.results[policy,cap], simulate_policy(p,policy,cap))
+
+    def test_eviction_limit_forwarded_to_native_backend(self):
+        t = trace([(i * 20, i * 20 + 1, blocks) for i, blocks in enumerate(
+            [['A'], ['B'], ['C'], ['D'], ['B'], ['C'], ['A'], ['B']])])
+        p = build_execution_plan(t)
+        for limit in (None, 1, 2, 10):
+            with self.subTest(limit=limit):
+                expected = simulate_sampled(p, 3, max_evictions=limit)
+                native = run_cpp_sweep(t, scheduler='recorded', capacities=[3],
+                                       policies=['sampled-lru'], warmup_requests=p.warmup_requests,
+                                       sampled_lru_max_evictions=limit)
+                self.assertEqual(expected, native.results['sampled-lru', 3])
+                self.assertEqual(expected, simulate_policy(p, 'sampled-lru', 3,
+                                                          sampled_lru_max_evictions=limit))
+        self.assertNotEqual(simulate_sampled(p, 3), simulate_sampled(p, 3, max_evictions=1))
+
+    def test_cli_eviction_limit_metadata_and_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'trace.jsonl'
+            path.write_text('\n'.join(json.dumps(dict(timestamp=i * 20, api_time=1,
+                hash_ids=['A'], input_length=1, block_size=1)) for i in range(4)))
+            cmd = [sys.executable, '-m', 'kvcache_sim', 'run', '--trace', str(path),
+                   '--model', 'qwen3-32b', '--budgets-gib', '0.00025', '--scheduler', 'recorded',
+                   '--policies', 'sampled-lru', '--format', 'json', '--no-progress']
+            result = subprocess.run(cmd + ['--sampled-lru-max-evictions', '1'],
+                                    capture_output=True, text=True, check=True)
+            parsed = json.loads(result.stdout)
+            self.assertEqual(parsed['metadata']['sampledLruParameters']['maxEvictions'], 1)
+            self.assertIn('max evictions 1', render_table(parsed))
+            for invalid in ('0', '-1', '4294967296', '1.5'):
+                self.assertNotEqual(subprocess.run(cmd + ['--sampled-lru-max-evictions', invalid],
+                                                  capture_output=True).returncode, 0)
+            native = str(ensure_cpp_simulator())
+            for invalid in ('0', '-1', '4294967296', '1.5'):
+                result = subprocess.run([native, '--sampled-lru-max-evictions', invalid],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('sampled', result.stderr)
 
     def test_timing_lists_released_before_launch(self):
         class L(list): pass
@@ -219,6 +288,26 @@ int main() {
   o.sampled_threshold = 0;
   SampledCache z(2, o); z.write(1, 0); z.write(2, 0); z.write(3, 0);
   assert(z.entries.size() == 1 && z.entries.count(3));
+  for (unsigned limit : {1, 2, 3, 10}) {
+    o.sampled_size = 5; o.sampled_threshold = 10; o.sampled_max_evictions = limit;
+    SampledCache limited(5, o);
+    for (unsigned i = 1; i <= 5; ++i) limited.write(i, 0);
+    limited.lookup(1, 5); limited.lookup(4, 10); limited.lookup(5, 20);
+    limited.write(6, 20);
+    const auto count = std::min(limit, 3U);
+    assert(limited.entries.size() == 6 - count && limited.free.size() == count - 1);
+    assert(!limited.entries.count(2));
+    assert(bool(limited.entries.count(3)) == (limit < 2));
+    assert(bool(limited.entries.count(1)) == (limit < 3));
+    assert(limited.entries.count(4) && limited.entries.count(5) && limited.entries.count(6));
+  }
+  o.sampled_max_evictions = 1; o.sampled_threshold = 10;
+  SampledCache fallback(2, o);
+  fallback.write(1, 0); fallback.write(2, 0); fallback.write(3, 0);
+  assert(fallback.entries.size() == 2 && fallback.entries.count(2) && fallback.threshold == 10);
+  o.sampled_threshold = 0;
+  SampledCache zero(2, o); zero.write(1, 0); zero.write(2, 0); zero.write(3, 0);
+  assert(zero.entries.size() == 2 && zero.entries.count(2) && zero.entries.count(3));
 }
 """
         with tempfile.TemporaryDirectory() as tmp:

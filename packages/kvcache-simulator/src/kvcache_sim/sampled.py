@@ -8,12 +8,15 @@ from dataclasses import dataclass
 from .trace import seconds_us
 
 
-def validate_parameters(threshold: float, sample_size: int, seed: int) -> int:
+def validate_parameters(threshold: float, sample_size: int, seed: int, max_evictions: int | None = None) -> int:
     threshold_us = seconds_us(threshold)
     if isinstance(sample_size, bool) or not isinstance(sample_size, int) or not 1 <= sample_size <= 2**32 - 1:
         raise ValueError("sampled_lru_sample_size must be a positive uint32 integer")
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**64:
         raise ValueError("sampled_lru_seed must be an unsigned 64-bit integer")
+    if max_evictions is not None and (isinstance(max_evictions, bool) or not isinstance(max_evictions, int)
+                                     or not 1 <= max_evictions <= 2**32 - 1):
+        raise ValueError("sampled_lru_max_evictions must be a positive uint32 integer or None")
     return threshold_us
 
 
@@ -25,8 +28,10 @@ class Slot:
 
 
 class SampledCache:
-    def __init__(self, capacity: int, threshold_us: int, sample_size: int, seed: int):
+    def __init__(self, capacity: int, threshold_us: int, sample_size: int, seed: int, max_evictions: int | None = None):
         self.capacity, self.threshold, self.sample_size = capacity, threshold_us, sample_size
+        validate_parameters(0, sample_size, seed, max_evictions)
+        self.max_evictions = max_evictions
         self.rng = random.Random(seed)
         self.entries: dict[int, int] = {}
         self.slots: list[Slot | None] = []
@@ -53,7 +58,8 @@ class SampledCache:
         eligible = lambda slot, threshold: threshold == 0 or now - slot.timestamp > threshold
         sampled = self.rng.sample(range(len(self.slots)), min(self.sample_size, len(self.slots)))
         victims = [i for i in sampled if eligible(self.slots[i], self.threshold)]
-        for index in sorted(victims, key=lambda i: (self.slots[i].timestamp, self.slots[i].sequence, i)):
+        victims.sort(key=lambda i: (self.slots[i].timestamp, self.slots[i].sequence, i))
+        for index in victims[:self.max_evictions]:
             self.discard(index)
         if victims:
             return
@@ -81,16 +87,16 @@ class SampledCache:
         self.entries[node] = index
 
 
-def simulate_sampled(plan, capacity, *, threshold=10.0, sample_size=16, seed=0):
+def simulate_sampled(plan, capacity, *, threshold=10.0, sample_size=16, seed=0, max_evictions=None):
     # Local import avoids coupling legacy policy code to this scheduler.
     from .policies import _finish, _no_cache, _underfilled
-    threshold_us = validate_parameters(threshold, sample_size, seed)
+    threshold_us = validate_parameters(threshold, sample_size, seed, max_evictions)
     if any(values is None or len(values) != plan.request_count for values in
            (plan.arrivals, plan.completions, plan.completion_order)):
         raise ValueError("sampled-lru requires complete request timing data")
     if capacity <= 0:
         return _no_cache("sampled-lru", capacity, plan)
-    cache = SampledCache(capacity, threshold_us, sample_size, seed)
+    cache = SampledCache(capacity, threshold_us, sample_size, seed, max_evictions)
     pending = []
     cursor = hits = 0
     full = False

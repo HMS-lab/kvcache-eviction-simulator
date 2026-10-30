@@ -186,6 +186,7 @@ Python API calls to `run_sweep()` and `run_cpp_sweep()` also require `scheduler=
 | `--policies fifo,lru,lru-flat,hyper-clock,optimal,sampled-lru` | C++ defaults to all six policies. Python defaults to the five existing policies. |
 | `--scheduler recorded\|sequential` | Required. Selects one scheduler for every policy and the ceiling. |
 | `--hyper-clock-max-score N` | Hyper Clock score limit; default `3`. Must be an integer in `1..2^64-1`. |
+| `--sampled-lru-max-evictions k` | Evict at most `k` oldest qualifying sampled blocks; default evicts all qualifying sampled blocks. |
 | `--backend cpp\|python` | Default is `cpp`. Python supports sequential replay for the five existing policies. |
 | `--jobs N` | Number of worker processes for the Python backend. The C++ backend runs one batch process and ignores this option. |
 | `--no-progress` | Disable terminal progress output. Progress is written to stderr only when stderr is interactive, so JSON stdout stays valid. |

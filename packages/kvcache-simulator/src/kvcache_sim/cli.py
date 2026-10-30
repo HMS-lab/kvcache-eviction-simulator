@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--hyper-clock-max-score", type=_parse_hyper_clock_max_score, default=3, help="Hyper Clock maximum score, a positive integer (default: 3)")
         command.add_argument("--sampled-lru-threshold-seconds", type=float, default=10.0, help="Sampled LRU age threshold in seconds (default: 10)")
         command.add_argument("--sampled-lru-sample-size", type=int, default=16, help="Number of sampled slots (default: 16)")
+        command.add_argument("--sampled-lru-max-evictions", type=int, default=None, help="Maximum oldest qualifying sampled blocks to evict per eviction (positive integer; default: all qualifying blocks)")
         command.add_argument("--sampled-lru-seed", type=int, default=0, help="Sampled LRU random seed (default: 0)")
         command.add_argument("--backend", choices=["cpp", "python"], default="cpp", help="Simulation backend (default: cpp)")
         command.add_argument("--jobs", type=int, default=1, help="Worker processes for the Python backend; ignored by the C++ backend")
@@ -99,6 +100,7 @@ def run_sweep_command(args: argparse.Namespace) -> int:
             sampled_lru_threshold_seconds=args.sampled_lru_threshold_seconds,
             sampled_lru_sample_size=args.sampled_lru_sample_size,
             sampled_lru_seed=args.sampled_lru_seed,
+            sampled_lru_max_evictions=args.sampled_lru_max_evictions,
             hyper_clock_max_score=args.hyper_clock_max_score,
             release_trace_data=True,
             jobs=args.jobs,

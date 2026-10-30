@@ -148,6 +148,7 @@ def run_cpp_sweep(
     sampled_lru_threshold_seconds: float = 10.0,
     sampled_lru_sample_size: int = 16,
     sampled_lru_seed: int = 0,
+    sampled_lru_max_evictions: int | None = None,
     release_trace_data: bool = False,
     progress: ProgressCallback | None = None,
 ) -> CppSweepResult:
@@ -155,7 +156,8 @@ def run_cpp_sweep(
     validate_hyper_clock_max_score(hyper_clock_max_score)
     if scheduler not in {"recorded", "sequential"}:
         raise ValueError(f"Unsupported scheduler: {scheduler}")
-    threshold_us = (validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size, sampled_lru_seed)
+    threshold_us = (validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size,
+                                        sampled_lru_seed, sampled_lru_max_evictions)
                     if "sampled-lru" in policies else 10_000_000)
     if scheduler == "recorded" and any(values is None or len(values) != trace.request_count for values in
                                        (trace.arrivals, trace.completions, trace.completion_order)):
@@ -214,6 +216,8 @@ def run_cpp_sweep(
             command.extend(("--sampled-lru-threshold-us", str(threshold_us),
                             "--sampled-lru-sample-size", str(sampled_lru_sample_size),
                             "--sampled-lru-seed", str(sampled_lru_seed)))
+        if "sampled-lru" in policies and sampled_lru_max_evictions is not None:
+            command.extend(("--sampled-lru-max-evictions", str(sampled_lru_max_evictions)))
         if progress:
             command.append("--progress")
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

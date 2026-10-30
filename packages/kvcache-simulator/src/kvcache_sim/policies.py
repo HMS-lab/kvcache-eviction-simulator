@@ -464,6 +464,7 @@ def simulate_policy(
     sampled_lru_threshold_seconds: float = 10.0,
     sampled_lru_sample_size: int = 16,
     sampled_lru_seed: int = 0,
+    sampled_lru_max_evictions: int | None = None,
 ) -> PolicyResult:
     validate_hyper_clock_max_score(hyper_clock_max_score)
     if policy == "sampled-lru":
@@ -471,6 +472,7 @@ def simulate_policy(
         return simulate_sampled(
             plan, capacity, threshold=sampled_lru_threshold_seconds,
             sample_size=sampled_lru_sample_size, seed=sampled_lru_seed,
+            max_evictions=sampled_lru_max_evictions,
         )
     if policy == "fifo":
         return simulate_fifo(plan, capacity)

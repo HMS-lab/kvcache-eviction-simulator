@@ -37,7 +37,9 @@ def render_table(result: dict[str, Any]) -> str:
         lines.insert(-1, f"Hyper Clock max score: {max_score}")
     if "sampled-lru" in policies:
         params = meta["sampledLruParameters"]
-        lines.insert(-1, f"Sampled LRU: threshold {params['thresholdSeconds']}s, sample {params['sampleSize']}, seed {params['seed']}")
+        eviction_limit = params.get("maxEvictions")
+        eviction_limit = "all" if eviction_limit is None else eviction_limit
+        lines.insert(-1, f"Sampled LRU: threshold {params['thresholdSeconds']}s, sample {params['sampleSize']}, seed {params['seed']}, max evictions {eviction_limit}")
         lines.insert(-1, "Replay: SAMPLED-LRU uses recorded arrivals/completions; other policies and the ceiling use sequential replay.")
         lines.insert(-1, "Speedup is an ideal prefill bound, not measured latency or throughput.")
     for policy, reason in meta.get("skippedPolicies", {}).items():

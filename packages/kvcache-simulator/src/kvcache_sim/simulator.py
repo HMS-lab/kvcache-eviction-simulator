@@ -96,6 +96,7 @@ def run_sweep(
     sampled_lru_threshold_seconds: float = 10.0,
     sampled_lru_sample_size: int = 16,
     sampled_lru_seed: int = 0,
+    sampled_lru_max_evictions: int | None = None,
     jobs: int = 1,
     backend: str = "cpp",
     progress: ProgressCallback | None = None,
@@ -139,10 +140,12 @@ def run_sweep(
     selected_budgets = sorted(set(budgets_gib or DEFAULT_BUDGETS_GIB))
     selected_policies = list(policies or DEFAULT_POLICIES)
     sampled = dict(sampled_lru_threshold_seconds=sampled_lru_threshold_seconds,
-                   sampled_lru_sample_size=sampled_lru_sample_size, sampled_lru_seed=sampled_lru_seed)
+                   sampled_lru_sample_size=sampled_lru_sample_size, sampled_lru_seed=sampled_lru_seed,
+                   sampled_lru_max_evictions=sampled_lru_max_evictions)
     skipped = {}
     if "sampled-lru" in selected_policies:
-        validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size, sampled_lru_seed)
+        validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size,
+                            sampled_lru_seed, sampled_lru_max_evictions)
         if backend == "python":
             reason = "sampled-lru with sequential scheduling requires the C++ backend"
             if policies:
@@ -232,7 +235,8 @@ def run_sweep(
             "replayModes": {p: scheduler for p in selected_policies},
             "ceilingReplayMode": scheduler,
             **({"sampledLruParameters": {"thresholdSeconds": sampled_lru_threshold_seconds,
-                "sampleSize": sampled_lru_sample_size, "seed": sampled_lru_seed}} if "sampled-lru" in selected_policies else {}),
+                "sampleSize": sampled_lru_sample_size, "seed": sampled_lru_seed,
+                "maxEvictions": sampled_lru_max_evictions}} if "sampled-lru" in selected_policies else {}),
             "modelId": cache_size.model_id,
             "modelLabel": cache_size.model_label,
             "precision": cache_size.precision,

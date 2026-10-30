@@ -21,11 +21,12 @@ kvcache-simulator run --scheduler recorded --trace converted.jsonl --model glm-5
 
 ## Defaults and sampling
 
-All three policy parameters are optional. The defaults are:
+All four policy parameters are optional. The defaults are:
 
 - A threshold of **10 seconds**.
 - A sample size of 16 blocks.
 - A random seed of 0.
+- No eviction limit: evict all qualifying sampled blocks.
 
 A threshold of zero makes every resident block eligible for eviction.
 A resident block is a block that the cache currently stores.
@@ -65,6 +66,7 @@ The sweep and policy APIs accept these parameters:
 - `sampled_lru_threshold_seconds`.
 - `sampled_lru_sample_size`.
 - `sampled_lru_seed`.
+- `sampled_lru_max_evictions` (default `None`, meaning no limit).
 
 ## Clock and cache access
 
@@ -157,9 +159,16 @@ Both tests use the C++ backend:
 
 When an insertion finds the cache full, the policy samples up to the configured
 number of resident entries. It evicts **all** sampled entries strictly older than
-the threshold. Later writes use the extra free slots without further sampling.
+the threshold by default. Set `--sampled-lru-max-evictions k` (or
+`sampled_lru_max_evictions=k` in the sweep/policy APIs) to evict at most `k`
+qualifying sampled blocks, starting with the oldest. The limit must be a positive
+32-bit integer. A limit of 1 evicts only the oldest qualifying sampled block;
+a limit larger than the sample size can evict the entire qualifying sample.
+Ties in access time use access sequence, oldest first. Blocks whose age equals
+the positive threshold do not qualify. Later writes use the extra free slots
+without further sampling.
 
-If no sampled entry qualifies, the policy uses this fallback:
+The limit does not change the fallback. If no sampled entry qualifies, the policy uses this fallback:
 
 1. Scan slots from index zero.
 2. Stop after finding and evicting one eligible entry.

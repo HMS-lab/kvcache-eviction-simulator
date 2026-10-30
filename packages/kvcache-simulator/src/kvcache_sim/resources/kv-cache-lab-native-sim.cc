@@ -42,7 +42,7 @@ struct Options {
   bool progress = false;
   std::string arrivals_path, completions_path, order_path;
   std::uint64_t sampled_threshold = 10000000, sampled_seed = 0;
-  std::uint32_t sampled_size = 16;
+  std::uint32_t sampled_size = 16, sampled_max_evictions = 0xffffffffU;
 };
 
 struct Result {
@@ -142,6 +142,11 @@ Options parse_args(int argc, char** argv) {
       auto n = parse_sampled_u64(require_value(arg), arg);
       if (!n || n > 0xffffffffULL) throw std::runtime_error("Invalid sampled sample size");
       options.sampled_size = n;
+    }
+    else if (arg == "--sampled-lru-max-evictions") {
+      auto n = parse_sampled_u64(require_value(arg), arg);
+      if (!n || n > 0xffffffffULL) throw std::runtime_error("Invalid sampled max evictions");
+      options.sampled_max_evictions = n;
     }
     else if (arg == "--progress") options.progress = true;
     else throw std::runtime_error("Unknown argument: " + arg);
@@ -1029,14 +1034,14 @@ struct SampledSlot {
   std::uint64_t timestamp = 0, sequence = 0;
 };
 struct SampledCache {
-  std::uint32_t capacity, sample_size;
+  std::uint32_t capacity, sample_size, max_evictions;
   std::uint64_t threshold, sequence = 0;
   std::mt19937_64 rng;
   std::vector<SampledSlot> slots;
   std::vector<std::size_t> free;
   std::unordered_map<std::uint32_t, std::size_t> entries;
   SampledCache(std::uint32_t cap, const Options& o)
-      : capacity(cap), sample_size(o.sampled_size), threshold(o.sampled_threshold), rng(o.sampled_seed) {}
+      : capacity(cap), sample_size(o.sampled_size), max_evictions(o.sampled_max_evictions), threshold(o.sampled_threshold), rng(o.sampled_seed) {}
   bool lookup(std::uint32_t node, std::uint64_t now) {
     auto it = entries.find(node);
     if (it == entries.end()) return false;
@@ -1056,7 +1061,13 @@ struct SampledCache {
     std::sort(sample.begin(), sample.end(), [](const auto& a, const auto& b) {
       return std::tie(a.timestamp, a.sequence) < std::tie(b.timestamp, b.sequence);
     });
-    for (const auto& slot : sample) if (eligible(slot, now, threshold)) discard(entries.at(slot.node));
+    std::uint32_t evicted = 0;
+    for (const auto& slot : sample) {
+      if (eligible(slot, now, threshold)) {
+        discard(entries.at(slot.node));
+        if (++evicted == max_evictions) break;
+      }
+    }
     if (!free.empty()) return;
     auto age = threshold;
     for (;;) {
