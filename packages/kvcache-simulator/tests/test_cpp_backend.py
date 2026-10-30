@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from array import array
+import io
 from pathlib import Path
 import json
 import shutil
@@ -13,6 +14,7 @@ import weakref
 from kvcache_sim.cpp_backend import _write_binary_trace, ensure_cpp_simulator, run_cpp_sweep
 from kvcache_sim.plan import build_execution_plan
 from kvcache_sim.policies import simulate_policy
+from kvcache_sim.progress import ProgressBar
 from kvcache_sim.simulator import DEFAULT_POLICIES, run_sweep
 from kvcache_sim.trace import parse_trace_lines
 
@@ -26,6 +28,18 @@ def make_trace():
 
 
 class BinaryTraceTests(unittest.TestCase):
+    def test_progress_preserves_full_label_and_clears_previous_line(self):
+        label = "hyper-clock (policy 3/4 cache capacity 12/20, 123456 blocks)"
+        output = io.StringIO()
+        with patch("sys.stderr", output):
+            bar = ProgressBar(enabled=True)
+            bar.update(1, 2, label)
+            bar.finish()
+        active, finished = output.getvalue().split("\r")[1:]
+        self.assertIn(label, active)
+        self.assertEqual(len(active), len(finished.rstrip("\n")))
+        self.assertTrue(finished.rstrip().endswith("done"))
+
     def test_writing_binary_files_preserves_input(self):
         trace = make_trace()
         ids, tokens, starts = trace.ids, trace.tokens, trace.request_starts
@@ -41,6 +55,27 @@ class BinaryTraceTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("c++"), "C++ compiler is not available")
 class NativeTraceHandoffTests(unittest.TestCase):
+    def test_progress_identifies_each_policy_and_capacity_before_evaluation(self):
+        updates = []
+        result = run_cpp_sweep(
+            make_trace(), scheduler="sequential", capacities=[4, 8, 4, -1],
+            policies=["hyper-clock", "sampled-lru"], warmup_requests=2,
+            progress=lambda done, total, label: updates.append((done, total, label)),
+        )
+        evaluations = [update for update in updates if " (policy " in update[2]]
+        expected_labels = [
+            f"{policy} (policy {policy_index}/2 cache capacity {capacity_index}/2, {capacity} blocks)"
+            for capacity_index, capacity in enumerate([4, 8], 1)
+            for policy_index, policy in enumerate(["sampled-lru", "hyper-clock"], 1)
+        ]
+        self.assertEqual([label for _, _, label in evaluations],
+                         [label for label in expected_labels for _ in range(2)])
+        # One trace-writing step and one ceiling step precede the four evaluations.
+        self.assertEqual([(done, total) for done, total, _ in evaluations],
+                         [(done, 6) for start in range(2, 6) for done in (start, start + 1)])
+        self.assertEqual(updates[-1], (6, 6, "simulation complete"))
+        self.assertEqual(len(result.results), 4)
+
     def test_lists_freed_before_process_starts_and_original_count_is_passed(self):
         class TrackedList(list):
             pass

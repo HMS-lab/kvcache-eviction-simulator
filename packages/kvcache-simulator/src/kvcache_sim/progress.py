@@ -8,6 +8,7 @@ class ProgressBar:
         self.enabled = enabled
         self.width = width
         self._active = False
+        self._line_width = 0
 
     def update(self, done: float, total: float, label: str) -> None:
         if not self.enabled:
@@ -17,7 +18,9 @@ class ProgressBar:
         filled = round(self.width * done_value / total_value)
         bar = "#" * filled + "-" * (self.width - filled)
         percent = round(100 * done_value / total_value)
-        sys.stderr.write(f"\r[{bar}] {percent:3d}% {label[:48]:48s}")
+        line = f"[{bar}] {percent:3d}% {label}"
+        sys.stderr.write("\r" + line.ljust(self._line_width))
+        self._line_width = len(line)
         sys.stderr.flush()
         self._active = True
 

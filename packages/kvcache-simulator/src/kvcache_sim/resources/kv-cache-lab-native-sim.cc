@@ -1129,6 +1129,14 @@ bool has_policy(const Options& options, const std::string& policy) {
   return std::find(options.policies.begin(), options.policies.end(), policy) != options.policies.end();
 }
 
+std::uint64_t selected_policy_count(const Options& options) {
+  std::uint64_t count = 0;
+  for (const auto* policy : {"sampled-lru", "fifo", "lru", "lru-flat", "hyper-clock", "optimal"}) {
+    if (has_policy(options, policy)) ++count;
+  }
+  return count;
+}
+
 void print_result(const std::string& policy, std::uint64_t cache_blocks, const Result& result, std::uint64_t trie_node_count, std::uint64_t warmup_requests) {
   std::cout << "{"
             << "\"policy\":\"" << policy << "\","
@@ -1216,12 +1224,13 @@ class SimulationRunner {
 
   void print_batch_results() {
     const std::uint64_t trie_node_count = input.prefix.parent.size();
-    const std::uint64_t total_steps = 1 + options.capacities.size();
+    const std::uint64_t policy_count = selected_policy_count(options);
+    const std::uint64_t total_steps = 1 + options.capacities.size() * policy_count;
     std::uint64_t completed_steps = 0;
 
+    report_progress(options, completed_steps, total_steps, "ceiling");
     const Result ceiling = run("ceiling", 0);
     completed_steps += 1;
-    report_progress(options, completed_steps, total_steps, "ceiling");
 
     std::cout << "{"
               << "\"trieNodeCount\":" << trie_node_count << ","
@@ -1232,7 +1241,21 @@ class SimulationRunner {
     std::cout << "},\"points\":[";
 
     bool first_point = true;
+    std::uint64_t capacity_index = 0;
     for (std::uint32_t capacity : options.capacities) {
+      ++capacity_index;
+      std::uint64_t policy_index = 0;
+      auto evaluate = [&](const std::string& policy) {
+        ++policy_index;
+        const std::string label = policy + " (policy " + std::to_string(policy_index) + "/" +
+            std::to_string(policy_count) + " cache capacity " + std::to_string(capacity_index) + "/" +
+            std::to_string(options.capacities.size()) + ", " + std::to_string(capacity) + " blocks)";
+        report_progress(options, completed_steps, total_steps, label);
+        Result result = run(policy, capacity);
+        ++completed_steps;
+        report_progress(options, completed_steps, total_steps, label);
+        return result;
+      };
       Result fifo;
       Result lru;
       Result flat_lru;
@@ -1240,12 +1263,12 @@ class SimulationRunner {
       Result optimal;
       Result sampled;
       const bool run_sampled = has_policy(options, "sampled-lru");
-      if (run_sampled) sampled = run("sampled-lru", capacity);
-      if (has_policy(options, "fifo")) fifo = run("fifo", capacity);
-      if (has_policy(options, "lru")) lru = run("lru", capacity);
-      if (has_policy(options, "lru-flat")) flat_lru = run("lru-flat", capacity);
-      if (has_policy(options, "hyper-clock")) hyper_clock = run("hyper-clock", capacity);
-      if (has_policy(options, "optimal")) optimal = run("optimal", capacity);
+      if (run_sampled) sampled = evaluate("sampled-lru");
+      if (has_policy(options, "fifo")) fifo = evaluate("fifo");
+      if (has_policy(options, "lru")) lru = evaluate("lru");
+      if (has_policy(options, "lru-flat")) flat_lru = evaluate("lru-flat");
+      if (has_policy(options, "hyper-clock")) hyper_clock = evaluate("hyper-clock");
+      if (has_policy(options, "optimal")) optimal = evaluate("optimal");
 
       if (!first_point) std::cout << ",";
       first_point = false;
@@ -1282,10 +1305,8 @@ class SimulationRunner {
         std::cout << "}";
       }
       std::cout << "}";
-
-      completed_steps += 1;
-      report_progress(options, completed_steps, total_steps, "capacity");
     }
+    report_progress(options, total_steps, total_steps, "simulation complete");
     std::cout << "]}\n";
   }
 
@@ -1306,7 +1327,7 @@ int main(int argc, char** argv) {
       return 0;
     }
 
-    report_progress(options, 0, 1 + options.capacities.size(), "load");
+    report_progress(options, 0, 1 + options.capacities.size() * selected_policy_count(options), "load");
     const SimulationInput input = load_simulation_input(options);
     SimulationRunner runner(input, options);
     const std::uint64_t trie_node_count = input.prefix.parent.size();
