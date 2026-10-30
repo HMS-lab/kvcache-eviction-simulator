@@ -1258,9 +1258,9 @@ class SimulationRunner {
       std::uint64_t policy_index = 0;
       auto evaluate = [&](const std::string& policy) {
         ++policy_index;
-        const std::string label = policy + " (policy " + std::to_string(policy_index) + "/" +
-            std::to_string(policy_count) + " cache capacity " + std::to_string(capacity_index) + "/" +
-            std::to_string(options.capacities.size()) + ", " + std::to_string(capacity) + " blocks)";
+        const std::string label = policy + " (cache capacity " + std::to_string(capacity_index) + "/" +
+            std::to_string(options.capacities.size()) + ", " + std::to_string(capacity) + " blocks; policy " +
+            std::to_string(policy_index) + "/" + std::to_string(policy_count) + ")";
         report_progress(options, completed_steps, total_steps, label);
         Result result = run(policy, capacity);
         ++completed_steps;

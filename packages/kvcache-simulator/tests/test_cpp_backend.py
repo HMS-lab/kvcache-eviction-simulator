@@ -29,7 +29,7 @@ def make_trace():
 
 class BinaryTraceTests(unittest.TestCase):
     def test_progress_preserves_full_label_and_clears_previous_line(self):
-        label = "hyper-clock (policy 3/4 cache capacity 12/20, 123456 blocks)"
+        label = "hyper-clock (cache capacity 12/20, 123456 blocks; policy 3/4)"
         output = io.StringIO()
         with patch("sys.stderr", output):
             bar = ProgressBar(enabled=True)
@@ -62,9 +62,9 @@ class NativeTraceHandoffTests(unittest.TestCase):
             policies=["hyper-clock", "sampled-lru"], warmup_requests=2,
             progress=lambda done, total, label: updates.append((done, total, label)),
         )
-        evaluations = [update for update in updates if " (policy " in update[2]]
+        evaluations = [update for update in updates if " (cache capacity " in update[2]]
         expected_labels = [
-            f"{policy} (policy {policy_index}/2 cache capacity {capacity_index}/2, {capacity} blocks)"
+            f"{policy} (cache capacity {capacity_index}/2, {capacity} blocks; policy {policy_index}/2)"
             for capacity_index, capacity in enumerate([4, 8], 1)
             for policy_index, policy in enumerate(["sampled-lru", "hyper-clock"], 1)
         ]
