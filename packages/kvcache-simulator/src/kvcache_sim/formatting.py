@@ -27,6 +27,7 @@ def render_table(result: dict[str, Any]) -> str:
         f"Trace: {format_number(meta['requestCount'])} requests, {format_number(meta['uniqueBlocks'])} prefix blocks, block size {meta['blockSize']} tokens",
         f"Accounting: {meta['bytesPerToken']:.5f} bytes/token, {meta['bytesPerBlock']:.5f} bytes/block, estimate tokens {meta['estimateTokens']}",
         f"Simulation backend: {str(meta.get('backend', 'cpp')).upper()}",
+        f"Replay: all policies and the ceiling use {meta['scheduler']} scheduling.",
         f"Hit rate ceiling: {format_percent(result['hitRateCeiling'])}",
         "Measurement: hit rates use the last 50% of requests; budget points that do not fill the cache before this window are omitted.",
         "Speedup: 1.0x means no-cache prefill throughput where every prefill input token is computed.",
@@ -40,7 +41,6 @@ def render_table(result: dict[str, Any]) -> str:
         eviction_limit = params.get("maxEvictions")
         eviction_limit = "all" if eviction_limit is None else eviction_limit
         lines.insert(-1, f"Sampled LRU: threshold {params['thresholdSeconds']}s, sample {params['sampleSize']}, seed {params['seed']}, max evictions {eviction_limit}")
-        lines.insert(-1, "Replay: SAMPLED-LRU uses recorded arrivals/completions; other policies and the ceiling use sequential replay.")
         lines.insert(-1, "Speedup is an ideal prefill bound, not measured latency or throughput.")
     for policy, reason in meta.get("skippedPolicies", {}).items():
         lines.insert(-1, f"Skipped {policy}: {reason}")
