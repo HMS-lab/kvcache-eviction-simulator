@@ -47,6 +47,7 @@ def render_table(result: dict[str, Any], *, show_speedups: bool = False) -> str:
         lines.insert(-1, f"Skipped {policy}: {reason}")
     headers = ["Budget", "Cache blocks"]
     labels = {
+        "lru": "LRU (prefix aware)",
         "lru-flat-touch-on-put": "Flat LRU (touch on put)",
         "flat-lru-memcache": "Flat LRU (memcache)",
     }
