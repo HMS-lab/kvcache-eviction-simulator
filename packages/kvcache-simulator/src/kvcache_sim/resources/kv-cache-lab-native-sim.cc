@@ -1056,8 +1056,15 @@ struct SampledCache {
   }
   void evict(std::uint64_t now) {
     std::vector<SampledSlot> sample;
-    std::sample(slots.begin(), slots.end(), std::back_inserter(sample),
-                std::min<std::size_t>(sample_size, slots.size()), rng);
+    const auto count = std::min<std::size_t>(sample_size, slots.size());
+    sample.reserve(count);
+    std::unordered_set<std::size_t> selected;
+    selected.reserve(count);
+    std::uniform_int_distribution<std::size_t> draw(0, slots.size() - 1);
+    while (sample.size() < count) {
+      const auto index = draw(rng);
+      if (selected.insert(index).second) sample.push_back(slots[index]);
+    }
     std::sort(sample.begin(), sample.end(), [](const auto& a, const auto& b) {
       return std::tie(a.timestamp, a.sequence) < std::tie(b.timestamp, b.sequence);
     });

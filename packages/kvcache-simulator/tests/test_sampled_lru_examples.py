@@ -143,11 +143,12 @@ class NativeDocumentedExamplesTests(unittest.TestCase):
         }
         if (!writing) reads.emplace_back(node,now,true);""", 1)
         cache = cache.replace("return slot.node != 0 &&", "eligibility_ages.push_back(age);\n    return slot.node != 0 &&", 1)
-        cache = cache.replace("rng);", """rng);
+        cache = cache.replace("    std::sort(sample.begin()", """
     if (!forced_sample.empty()) {
       sample.clear(); for (auto index : forced_sample) sample.push_back(slots.at(index));
       forced_sample.clear();
-    }""", 1)
+    }
+    std::sort(sample.begin()""", 1)
         cache = cache.replace("void write(std::uint32_t node, std::uint64_t now) {", """void write(std::uint32_t node, std::uint64_t now) {
     struct Capture {
       SampledCache& cache; unsigned node; std::uint64_t now;

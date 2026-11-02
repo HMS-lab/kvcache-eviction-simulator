@@ -276,6 +276,22 @@ class NativeTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / 'src/kvcache_sim/resources/kv-cache-lab-native-sim.cc'
         harness = '#define main replay_main\n#include "' + str(source) + '"\n#undef main\n#include <cassert>\n' + r"""
 int main() {
+  // Every selected index must be distinct, including when most slots are sampled.
+  for (unsigned seed = 0; seed < 100; ++seed) {
+    for (unsigned size : {1, 4, 5, 16}) {
+      Options sampling; sampling.sampled_size = size;
+      sampling.sampled_threshold = 0; sampling.sampled_seed = seed;
+      SampledCache sampled(5, sampling);
+      for (unsigned i = 1; i <= 5; ++i) sampled.write(i, 0);
+      sampled.write(6, 0);
+      const auto count = std::min(size, 5U);
+      assert(sampled.entries.size() == 6 - count);
+      assert(sampled.free.size() == count - 1);
+      assert(sampled.entries.count(6));
+      for (const auto& entry : sampled.entries)
+        assert(sampled.slots.at(entry.second).node == entry.first);
+    }
+  }
   Options o; o.sampled_size = 4; o.sampled_threshold = 10;
   SampledCache c(4, o);
   for (unsigned i = 1; i <= 4; ++i) c.write(i, 0);
