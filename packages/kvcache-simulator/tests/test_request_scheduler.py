@@ -68,7 +68,7 @@ void shared_policy_scheduler() {
     RequestScheduler* selected = &RequestScheduler::get();
     assert((dynamic_cast<RecordedTimeScheduler*>(selected) != nullptr) == (options.scheduler == "recorded"));
     for (unsigned capacity : {1,99,0,1}) {
-      for (const auto* policy : {"ceiling","fifo","lru","lru-flat","hyper-clock","optimal","sampled-lru"}) {
+      for (const auto* policy : {"ceiling","fifo","lru","lru-flat-touch-on-put","hyper-clock","optimal","sampled-lru"}) {
         const auto result = runner.run(policy, capacity);
         assert(&RequestScheduler::get() == selected);
         if (capacity == 1) {
@@ -94,7 +94,7 @@ void legacy_regression() {
   input.prefix = build_prefix_plan(input.ids,input.request_ends);
   Options options; options.warmup_requests = 4; options.scheduler = "sequential";
   SimulationRunner runner(input, options);
-  const std::vector<std::string> policies{"fifo","lru","lru-flat","hyper-clock","optimal"};
+  const std::vector<std::string> policies{"fifo","lru","lru-flat-touch-on-put","hyper-clock","optimal"};
   // Captured from the C++ executable before the scheduler extraction.
   const std::vector<unsigned> capacities{0,1,2,3,4,5,6,7,8,99,3};
   const std::vector<std::vector<unsigned>> hits{
@@ -272,7 +272,7 @@ class NativeRequestSchedulerTests(unittest.TestCase):
             for capacity, point in zip(capacities,batch['points']):
                 single = run('--policy', 'all', '--capacity', str(capacity))
                 # Native all and batch expose the same named result payloads.
-                for policy in ('fifo','lru','lru-flat','hyper-clock','optimal','sampled-lru'):
+                for policy in ('fifo','lru','lru-flat-touch-on-put','hyper-clock','optimal','sampled-lru'):
                     self.assertEqual(point[policy], single[policy])
                 sampled = run('--policy', 'sampled-lru', '--capacity', str(capacity))
                 self.assertEqual(point['sampled-lru']['hitTokens'], sampled['hitTokens'])

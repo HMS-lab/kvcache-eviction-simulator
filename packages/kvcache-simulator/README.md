@@ -117,7 +117,7 @@ Use the same scheduler when you compare policy results.
 | Backend | C++ supports all six policies. Python supports the five existing policies. | C++ supports all six policies. |
 
 Use sequential replay to compare eviction behavior with immediate cache writes.
-It preserves the original replay order for FIFO, LRU, LRU-FLAT, HYPER-CLOCK, and OPTIMAL.
+It preserves the original replay order for FIFO, LRU, Flat LRU (touch on put), HYPER-CLOCK, and OPTIMAL.
 For example:
 
 ```bash
@@ -183,7 +183,7 @@ Python API calls to `run_sweep()` and `run_cpp_sweep()` also require `scheduler=
 | `--block-size N` | Fallback block size when trace records omit `block_size`; trace-declared `block_size` overrides it. |
 | `--estimate-tokens N` | Override the token count used for token-dependent bytes/token formulas. By default the trace average input length is used. |
 | `--budgets-gib A,B,C` | Comma-separated KV cache memory budgets in GiB. Default matches the web budget sweep: `1,2,4,...,16384`. |
-| `--policies fifo,lru,lru-flat,hyper-clock,optimal,sampled-lru` | C++ defaults to all six policies. Python defaults to the five existing policies. |
+| `--policies fifo,lru,lru-flat-touch-on-put,hyper-clock,optimal,sampled-lru` | C++ defaults to all six policies. Python defaults to the five existing policies. |
 | `--scheduler recorded\|sequential` | Required. Selects one scheduler for every policy and the ceiling. |
 | `--hyper-clock-max-score N` | Hyper Clock score limit; default `3`. Must be an integer in `1..2^64-1`. |
 | `--sampled-lru-max-evictions k` | Evict at most `k` oldest qualifying sampled blocks; default evicts all qualifying sampled blocks. |
@@ -197,11 +197,11 @@ Python API calls to `run_sweep()` and `run_cpp_sweep()` also require `scheduler=
 
 ## Output Semantics
 
-All policies use prefix-specific block identities: the same raw block ID under different preceding prefixes occupies separate cache entries. `lru` evicts eligible trie leaves and protects the current request's cached path. `lru-flat` evicts the least recently used entry regardless of its parent or children; eviction leaves descendants cached.
+All policies use prefix-specific block identities: the same raw block ID under different preceding prefixes occupies separate cache entries. `lru` evicts eligible trie leaves and protects the current request's cached path. `lru-flat-touch-on-put` evicts the least recently used entry regardless of its parent or children; eviction leaves descendants cached.
 
-Flat LRU processes each request with separate read and write passes. Reading refreshes only the continuous cached prefix, stopping at the first miss. Writing visits the complete request in prefix order: an exact cached node is refreshed, and a missing node is inserted, evicting the least recent entry when full. A matching raw block ID under another prefix is a different entry. The writer checks current membership even for blocks read earlier. Tail insertion may evict the head of the same request; the writer makes one pass without restarting repairs. Recency follows access order, not timestamps.
+Flat LRU (touch on put) processes each request with separate read and write passes. Reading refreshes only the continuous cached prefix, stopping at the first miss. Writing visits the complete request in prefix order: an exact cached node is refreshed, and a missing node is inserted, evicting the least recent entry when full. A matching raw block ID under another prefix is a different entry. The writer checks current membership even for blocks read earlier. Tail insertion may evict the head of the same request; the writer makes one pass without restarting repairs. Recency follows access order, not timestamps.
 
-Flat LRU appears as `LRU-FLAT hit` and `LRU-FLAT speedup` in the default table and as `lru-flat` in JSON results. To run only this policy, add `--policies lru-flat` with either backend.
+Flat LRU (touch on put) appears as `Flat LRU (touch on put) hit` and `Flat LRU (touch on put) speedup` in the default table and as `lru-flat-touch-on-put` in JSON results. To run only this policy, add `--policies lru-flat-touch-on-put` with either backend.
 
 ### Hyper Clock
 

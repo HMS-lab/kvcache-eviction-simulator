@@ -45,10 +45,11 @@ def render_table(result: dict[str, Any]) -> str:
     for policy, reason in meta.get("skippedPolicies", {}).items():
         lines.insert(-1, f"Skipped {policy}: {reason}")
     headers = ["Budget", "Cache blocks"]
+    labels = {"lru-flat-touch-on-put": "Flat LRU (touch on put)"}
     for policy in policies:
-        headers.append(f"{policy.upper()} hit")
+        headers.append(f"{labels.get(policy, policy.upper())} hit")
     for policy in policies:
-        headers.append(f"{policy.upper()} speedup")
+        headers.append(f"{labels.get(policy, policy.upper())} speedup")
     rows: list[list[str]] = []
     for point in result.get("points", []):
         row = [f"{format_number(point['gib'])} GiB", format_number(point["cacheBlocks"])]

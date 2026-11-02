@@ -13,7 +13,7 @@ from .sampled import validate_parameters
 from .trace import TraceData
 
 DEFAULT_BUDGETS_GIB = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-DEFAULT_POLICIES = ["fifo", "lru", "lru-flat", "hyper-clock", "optimal", "sampled-lru"]
+DEFAULT_POLICIES = ["fifo", "lru", "lru-flat-touch-on-put", "hyper-clock", "optimal", "sampled-lru"]
 THROUGHPUT_EPSILON = 0.001
 THROUGHPUT_DISPLAY_CAP = 1000.0
 
