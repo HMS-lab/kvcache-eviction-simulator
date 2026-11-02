@@ -1039,17 +1039,20 @@ struct SampledCache {
   std::mt19937_64 rng;
   std::vector<SampledSlot> slots;
   std::vector<std::size_t> free;
-  std::unordered_map<std::uint32_t, std::size_t> entries;
-  SampledCache(std::uint32_t cap, const Options& o)
-      : capacity(cap), sample_size(o.sampled_size), max_evictions(o.sampled_max_evictions), threshold(o.sampled_threshold), rng(o.sampled_seed) {}
+  static constexpr std::uint32_t absent = 0xffffffffU;
+  std::vector<std::uint32_t> node_to_slot;
+  SampledCache(std::uint32_t cap, const Options& o, std::size_t node_count)
+      : capacity(cap), sample_size(o.sampled_size), max_evictions(o.sampled_max_evictions), threshold(o.sampled_threshold), rng(o.sampled_seed), node_to_slot(node_count, absent) {}
+  std::size_t size() const { return slots.size() - free.size(); }
+  bool contains(std::uint32_t node) const { return node_to_slot[node] != absent; }
   bool lookup(std::uint32_t node, std::uint64_t now) {
-    auto it = entries.find(node);
-    if (it == entries.end()) return false;
-    auto& slot = slots[it->second]; slot.timestamp = now; slot.sequence = ++sequence;
+    const auto index = node_to_slot[node];
+    if (index == absent) return false;
+    auto& slot = slots[index]; slot.timestamp = now; slot.sequence = ++sequence;
     return true;
   }
   void discard(std::size_t index) {
-    entries.erase(slots[index].node); slots[index] = {}; free.push_back(index);
+    node_to_slot[slots[index].node] = absent; slots[index] = {}; free.push_back(index);
   }
   bool eligible(const SampledSlot& slot, std::uint64_t now, std::uint64_t age) const {
     return slot.node != 0 && (age == 0 || now - slot.timestamp > age);
@@ -1071,7 +1074,7 @@ struct SampledCache {
     std::uint32_t evicted = 0;
     for (const auto& slot : sample) {
       if (eligible(slot, now, threshold)) {
-        discard(entries.at(slot.node));
+        discard(node_to_slot[slot.node]);
         if (++evicted == max_evictions) break;
       }
     }
@@ -1084,11 +1087,11 @@ struct SampledCache {
   }
   void write(std::uint32_t node, std::uint64_t now) {
     if (!capacity || lookup(node, now)) return;
-    if (entries.size() == capacity) evict(now);
+    if (size() == capacity) evict(now);
     std::size_t index;
     if (free.empty()) { index = slots.size(); slots.push_back({}); }
     else { index = free.back(); free.pop_back(); }
-    slots[index] = {node, now, ++sequence}; entries[node] = index;
+    slots[index] = {node, now, ++sequence}; node_to_slot[node] = static_cast<std::uint32_t>(index);
   }
 };
 
@@ -1099,7 +1102,7 @@ Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, co
     scheduler.reset();
     return no_cache_result(input, options);
   }
-  SampledCache cache(capacity, options);
+  SampledCache cache(capacity, options, input.prefix.parent.size());
   Result result;
   result.measurement_start_request = options.warmup_requests;
   bool full = false;
@@ -1110,7 +1113,7 @@ Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, co
     if (event->kind == ScheduledEventKind::Completion) {
       for (auto i = start; i < end; ++i) {
         cache.write(input.prefix.node_for_event[i], event->timestamp);
-        if (cache.entries.size() == capacity) full = true;
+        if (cache.size() == capacity) full = true;
       }
     } else {
       if (request >= options.warmup_requests && !full) {

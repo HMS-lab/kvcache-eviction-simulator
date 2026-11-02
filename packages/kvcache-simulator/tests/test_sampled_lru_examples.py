@@ -47,7 +47,7 @@ SimulationInput input(std::vector<unsigned> ids, std::vector<unsigned> ends,
   return i;
 }
 void batch() {
-  auto o = options(3); SampledCache c(4,o);
+  auto o = options(3); SampledCache c(4,o,16);
   c.write(1,0); c.write(2,4*S); c.write(3,10*S); c.write(4,18*S);
   forced_sample = {0,1,2}; c.write(5,20*S);
   assert((state(c) == State{{0,0},{5,20*S},{3,10*S},{4,18*S}}));
@@ -59,7 +59,7 @@ void batch() {
   assert(c.free.empty());
 }
 void fallback() {
-  auto o = options(1); SampledCache c(3,o);
+  auto o = options(1); SampledCache c(3,o,16);
   c.write(1,0); c.write(2,15*S); c.write(3,19*S);
   forced_sample = {2}; eligibility_ages.clear(); c.write(4,20*S);
   assert((state(c) == State{{4,20*S},{2,15*S},{3,19*S}}));
@@ -67,7 +67,7 @@ void fallback() {
   assert(c.threshold == 10*S);
 }
 void halving() {
-  auto o = options(2); SampledCache c(2,o); c.write(1,8*S); c.write(2,8*S);
+  auto o = options(2); SampledCache c(2,o,16); c.write(1,8*S); c.write(2,8*S);
   eligibility_ages.clear(); c.write(3,10*S);
   assert((eligibility_ages == std::vector<std::uint64_t>{10*S,10*S,10*S,10*S,5*S,5*S,2500000,2500000,1250000}));
   assert((state(c) == State{{3,10*S},{2,8*S}}));
@@ -131,14 +131,14 @@ class NativeDocumentedExamplesTests(unittest.TestCase):
         # Hooks observe the actual implementation; they do not replace policy logic.
         anchor = "struct SampledSlot {"
         source = source.replace(anchor, HOOKS + "\n" + anchor, 1)
-        source = source.replace("rng(o.sampled_seed) {}", """rng(o.sampled_seed) {
+        source = source.replace("node_to_slot(node_count, absent) {}", """node_to_slot(node_count, absent) {
           for (auto item : preload) write(item.first,item.second);
           preload.clear(); reads.clear(); writes.clear();
         }""", 1)
         begin = source.index("struct SampledCache {")
         end = source.index("Result simulate_sampled(", begin)
         cache = source[begin:end]
-        cache = cache.replace("if (it == entries.end()) return false;", """if (it == entries.end()) {
+        cache = cache.replace("if (index == absent) return false;", """if (index == absent) {
           if (!writing) reads.emplace_back(node,now,false); return false;
         }
         if (!writing) reads.emplace_back(node,now,true);""", 1)

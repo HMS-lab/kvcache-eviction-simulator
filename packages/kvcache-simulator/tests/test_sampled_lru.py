@@ -281,49 +281,60 @@ int main() {
     for (unsigned size : {1, 4, 5, 16}) {
       Options sampling; sampling.sampled_size = size;
       sampling.sampled_threshold = 0; sampling.sampled_seed = seed;
-      SampledCache sampled(5, sampling);
+      SampledCache sampled(5, sampling, 16);
       for (unsigned i = 1; i <= 5; ++i) sampled.write(i, 0);
       sampled.write(6, 0);
       const auto count = std::min(size, 5U);
-      assert(sampled.entries.size() == 6 - count);
+      assert(sampled.size() == 6 - count);
       assert(sampled.free.size() == count - 1);
-      assert(sampled.entries.count(6));
-      for (const auto& entry : sampled.entries)
-        assert(sampled.slots.at(entry.second).node == entry.first);
+      assert(sampled.contains(6));
+      assert(sampled.node_to_slot.size() == 16);
+      for (unsigned node = 1; node < 16; ++node) {
+        if (sampled.contains(node))
+          assert(sampled.slots.at(sampled.node_to_slot[node]).node == node);
+      }
     }
   }
+  // An evicted node must miss, and reinsertion must restore its mapping.
+  Options reuse_options; reuse_options.sampled_threshold = 0;
+  SampledCache reuse(1, reuse_options, 1001);
+  reuse.write(1000, 0); assert(reuse.lookup(1000, 1));
+  reuse.write(1, 2); assert(!reuse.lookup(1000, 3));
+  reuse.write(1000, 4); assert(!reuse.lookup(1, 5));
+  assert(reuse.lookup(1000, 6) && reuse.size() == 1);
+  assert(reuse.node_to_slot.size() == 1001);
   Options o; o.sampled_size = 4; o.sampled_threshold = 10;
-  SampledCache c(4, o);
+  SampledCache c(4, o, 16);
   for (unsigned i = 1; i <= 4; ++i) c.write(i, 0);
   c.lookup(4, 20); c.write(5, 20);
-  assert(c.entries.size() == 2 && c.entries.count(4) && c.entries.count(5));
+  assert(c.size() == 2 && c.contains(4) && c.contains(5));
   c.write(6, 20); c.write(7, 20);
-  assert(c.entries.size() == 4 && c.free.empty());
+  assert(c.size() == 4 && c.free.empty());
   c.write(8, 20);
-  assert(c.threshold == 10 && c.entries.size() == 4);
+  assert(c.threshold == 10 && c.size() == 4);
   o.sampled_threshold = 0;
-  SampledCache z(2, o); z.write(1, 0); z.write(2, 0); z.write(3, 0);
-  assert(z.entries.size() == 1 && z.entries.count(3));
+  SampledCache z(2, o, 16); z.write(1, 0); z.write(2, 0); z.write(3, 0);
+  assert(z.size() == 1 && z.contains(3));
   for (unsigned limit : {1, 2, 3, 10}) {
     o.sampled_size = 5; o.sampled_threshold = 10; o.sampled_max_evictions = limit;
-    SampledCache limited(5, o);
+    SampledCache limited(5, o, 16);
     for (unsigned i = 1; i <= 5; ++i) limited.write(i, 0);
     limited.lookup(1, 5); limited.lookup(4, 10); limited.lookup(5, 20);
     limited.write(6, 20);
     const auto count = std::min(limit, 3U);
-    assert(limited.entries.size() == 6 - count && limited.free.size() == count - 1);
-    assert(!limited.entries.count(2));
-    assert(bool(limited.entries.count(3)) == (limit < 2));
-    assert(bool(limited.entries.count(1)) == (limit < 3));
-    assert(limited.entries.count(4) && limited.entries.count(5) && limited.entries.count(6));
+    assert(limited.size() == 6 - count && limited.free.size() == count - 1);
+    assert(!limited.contains(2));
+    assert(bool(limited.contains(3)) == (limit < 2));
+    assert(bool(limited.contains(1)) == (limit < 3));
+    assert(limited.contains(4) && limited.contains(5) && limited.contains(6));
   }
   o.sampled_max_evictions = 1; o.sampled_threshold = 10;
-  SampledCache fallback(2, o);
+  SampledCache fallback(2, o, 16);
   fallback.write(1, 0); fallback.write(2, 0); fallback.write(3, 0);
-  assert(fallback.entries.size() == 2 && fallback.entries.count(2) && fallback.threshold == 10);
+  assert(fallback.size() == 2 && fallback.contains(2) && fallback.threshold == 10);
   o.sampled_threshold = 0;
-  SampledCache zero(2, o); zero.write(1, 0); zero.write(2, 0); zero.write(3, 0);
-  assert(zero.entries.size() == 2 && zero.entries.count(2) && zero.entries.count(3));
+  SampledCache zero(2, o, 16); zero.write(1, 0); zero.write(2, 0); zero.write(3, 0);
+  assert(zero.size() == 2 && zero.contains(2) && zero.contains(3));
 }
 """
         with tempfile.TemporaryDirectory() as tmp:
