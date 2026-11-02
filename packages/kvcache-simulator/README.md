@@ -11,6 +11,7 @@
 - [Request schedulers](#request-schedulers)
 - [Options](#options)
 - [Output Semantics](#output-semantics)
+  - [Recency updates by policy](#recency-updates-by-policy)
   - [Flat LRU (memcache)](#flat-lru-memcache)
   - [Hyper Clock](#hyper-clock)
     - [Clock examples](#clock-examples)
@@ -222,6 +223,37 @@ All policies use prefix-specific block identities: the same raw block ID under d
 Flat LRU (touch on put) processes each request with separate read and write passes. Reading refreshes only the continuous cached prefix, stopping at the first miss. Writing visits the complete request in prefix order: an exact cached node is refreshed, and a missing node is inserted, evicting the least recent entry when full. A matching raw block ID under another prefix is a different entry. The writer checks current membership even for blocks read earlier. Tail insertion may evict the head of the same request; the writer makes one pass without restarting repairs. Recency follows access order, not timestamps.
 
 Flat LRU (touch on put) appears as `Flat LRU (touch on put) hit` in the default table, with `Flat LRU (touch on put) speedup` added by `--show-speedups`, and as `lru-flat-touch-on-put` in JSON results. To run only this policy, add `--policies lru-flat-touch-on-put` with either backend.
+
+### Recency updates by policy
+
+A get is a cache read at request arrival. A put is a cache write at request completion.
+Successful reads update entries only in the continuous cached prefix, before the first missing block.
+The same rules apply during warmup and measurement.
+
+| Policy ID | Insert a new entry | Successful get | Put an existing entry |
+| --- | --- | --- | --- |
+| `fifo` | Append to the FIFO queue | No change | No change |
+| `lru` | Mark as most recently used | Mark as most recently used | No change |
+| `lru-flat-touch-on-put` | Mark as most recently used | Mark as most recently used | Mark as most recently used |
+| `flat-lru-memcache` | Mark as most recently used | Mark as most recently used | No change |
+| `hyper-clock` | Set score to 1 | Increase score up to the configured maximum | Increase score only in the write suffix |
+| `optimal` | Set the next-use priority | Update the next-use priority | No change |
+| `sampling-lru-touch-on-put` | Update the last-access time | Update the last-access time | Update the last-access time |
+| `sampling-lru-touch-on-get` | Update the last-access time | Update the last-access time | No change |
+
+Sampling LRU records the current virtual time as the last-access time.
+If two updates have the same time, the update processed later counts as more recent.
+Reinsertion after eviction follows the rules for a new entry.
+
+Hyper Clock records where the arrival read stops. Its completion writes the suffix from that position.
+Existing entries in that suffix gain one score point, up to the configured maximum.
+Surviving entries from the earlier read prefix gain no additional points at completion.
+Hyper Clock reinserts missing entries from that prefix with score 1.
+Eviction scans decrease scores. See [Hyper Clock](#hyper-clock) for the scan rules.
+
+OPTIMAL tracks future requests instead of past access times.
+Each arrival advances the future-use information for every block in that request, including blocks beyond a prefix hole.
+It refreshes cached eviction priorities for successful prefix reads and initializes priorities on insertion.
 
 ### Flat LRU (memcache)
 
