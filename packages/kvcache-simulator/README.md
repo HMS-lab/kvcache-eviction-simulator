@@ -10,8 +10,8 @@ pip install kvcache-simulator
 
 The default backend compiles the bundled C++ simulator on first use.
 You need a local C++ compiler such as `c++` or `clang++`.
-The Python backend supports sequential replay for the six policies other than Sampled LRU.
-It does not support recorded-time replay or sequential Sampled LRU.
+The Python backend supports sequential replay for the six policies outside the Sampling LRU family.
+It does not support recorded-time replay or sequential Sampling LRU replay.
 
 ## Quick Start
 
@@ -114,7 +114,7 @@ Use the same scheduler when you compare policy results.
 | Cache writes | Immediately after that request's read. | At the recorded completion time. |
 | Timing fields | Not required. The scheduler ignores them. | Required for every request. |
 | Virtual clock | Always zero. | Jumps between event times without real-time waits. |
-| Backend | C++ supports all seven policies. Python supports the six policies other than Sampled LRU. | C++ supports all seven policies. |
+| Backend | C++ supports all eight policies. Python supports the six policies outside the Sampling LRU family. | C++ supports all eight policies. |
 
 Use sequential replay to compare eviction behavior with immediate cache writes.
 It preserves the original replay order for FIFO, LRU (prefix aware), Flat LRU (touch on put), HYPER-CLOCK, and OPTIMAL.
@@ -147,7 +147,7 @@ kvcache-simulator run \
 Recorded-time replay requires `timestamp` and at least one of `completion_timestamp` or `api_time`.
 All fields use seconds. Completion time is `timestamp + api_time` unless an absolute `completion_timestamp` supplies it.
 If both completion fields exist, their values must agree within one microsecond.
-Missing or invalid timing data stops the run, even when Sampled LRU is not selected.
+Missing or invalid timing data stops the run, even when neither Sampling LRU variant is selected.
 Sequential replay ignores missing or invalid timing data.
 
 At equal timestamps, previously admitted requests complete before new arrivals.
@@ -156,7 +156,7 @@ New zero-duration requests complete after the entire arrival batch.
 Completion ties use conversation identifiers and request indices.
 See [timing and tie rules](docs/SAMPLED_LRU.md#clock-and-cache-access) for details.
 
-Sequential replay keeps every Sampled LRU timestamp at zero.
+Sequential replay keeps every Sampling LRU timestamp at zero.
 A positive age threshold therefore reaches the threshold-halving fallback during eviction.
 A threshold of zero makes all sampled resident blocks eligible immediately.
 Use recorded-time replay when you need a threshold measured in seconds.
@@ -183,11 +183,11 @@ Python API calls to `run_sweep()` and `run_cpp_sweep()` also require `scheduler=
 | `--block-size N` | Fallback block size when trace records omit `block_size`; trace-declared `block_size` overrides it. |
 | `--estimate-tokens N` | Override the token count used for token-dependent bytes/token formulas. By default the trace average input length is used. |
 | `--budgets-gib A,B,C` | Comma-separated KV cache memory budgets in GiB. Default matches the web budget sweep: `1,2,4,...,16384`. |
-| `--policies fifo,lru,lru-flat-touch-on-put,flat-lru-memcache,hyper-clock,optimal,sampled-lru` | C++ defaults to all seven policies. Python defaults to the six policies other than Sampled LRU. |
+| `--policies fifo,lru,lru-flat-touch-on-put,flat-lru-memcache,hyper-clock,optimal,sampling-lru-touch-on-put,sampling-lru-touch-on-get` | C++ defaults to all eight policies. Python defaults to the six policies outside the Sampling LRU family. |
 | `--scheduler recorded\|sequential` | Required. Selects one scheduler for every policy and the ceiling. |
 | `--hyper-clock-max-score N` | Hyper Clock score limit; default `3`. Must be an integer in `1..2^64-1`. |
 | `--sampled-lru-max-evictions k` | Evict at most `k` oldest qualifying sampled blocks; default evicts all qualifying sampled blocks. |
-| `--backend cpp\|python` | Default is `cpp`. Python supports sequential replay for the six policies other than Sampled LRU. |
+| `--backend cpp\|python` | Default is `cpp`. Python supports sequential replay for the six policies outside the Sampling LRU family. |
 | `--jobs N` | Number of worker processes for the Python backend. The C++ backend runs one batch process and ignores this option. |
 | `--no-progress` | Disable terminal progress output. Progress is written to stderr only when stderr is interactive, so JSON stdout stays valid. |
 | `--format table\|json` | Output format. Default is `table`. |
@@ -303,6 +303,18 @@ pip install -e ./packages/kvcache-simulator
 pytest packages/kvcache-simulator
 ```
 
-### Sampled LRU and recorded-time replay
+### Sampling LRU variants and recorded-time replay
 
-See [Sampled LRU documentation](docs/SAMPLED_LRU.md) for configuration, timing, and eviction behavior.
+Both Sampling LRU variants run by default in C++.
+Select either variant with `--policies sampling-lru-touch-on-put` or `--policies sampling-lru-touch-on-get`.
+Both variants use the same `--sampled-lru-*` configuration flags.
+
+| Operation | Touch on put | Touch on get |
+| --- | --- | --- |
+| Insert a new entry | Set recency | Set recency |
+| Read a cached prefix block | Update recency | Update recency |
+| Put an existing entry at completion | Update recency | Keep recency |
+
+The variants use the same eviction rules. Existing policies keep their behavior.
+
+See [Sampling LRU documentation](docs/SAMPLED_LRU.md) for configuration, timing, and eviction behavior.

@@ -1,6 +1,6 @@
-# Sampled LRU and recorded-time replay
+# Sampling LRU variants and recorded-time replay
 
-The C++ backend runs `sampled-lru` with the six other policies by default.
+The C++ backend runs both Sampling LRU variants with the six other policies by default.
 Every policy uses the scheduler selected with the required `--scheduler` option.
 The ceiling uses the same scheduler.
 
@@ -15,9 +15,25 @@ Use your converted SemiAnalysis JSONL directly. No further conversion is necessa
 
 ```bash
 kvcache-simulator run --scheduler recorded --trace converted.jsonl --model glm-5.2 \
-  --policies sampled-lru --sampled-lru-threshold-seconds 10 \
+  --policies sampling-lru-touch-on-put --sampled-lru-threshold-seconds 10 \
   --sampled-lru-sample-size 16 --sampled-lru-seed 0
 ```
+
+## Recency variants
+
+Select `sampling-lru-touch-on-put` to update recency on insertion, successful reads, and puts to existing entries.
+Select `sampling-lru-touch-on-get` to update recency on insertion and successful reads only.
+For touch-on-get, a put to an existing entry changes neither its timestamp nor its recency sequence.
+An insertion after eviction sets a new timestamp and sequence in both variants.
+
+Both variants use the same `--sampled-lru-*` options and eviction rules.
+The existing touch-on-put policy keeps its behavior.
+The worked examples below describe touch-on-put.
+
+C++ tests check timestamps, recency sequences, eviction, and reinsertion:
+[`NativeTests.test_native_batch_eviction_and_fallback`](../tests/test_sampled_lru.py).
+A delayed completion causes different eviction victims and hit counts:
+[`NativeTests.test_touch_on_get_preserves_recency_at_delayed_completion`](../tests/test_sampled_lru.py).
 
 ## Defaults and sampling
 
@@ -31,13 +47,12 @@ All four policy parameters are optional. The defaults are:
 A threshold of zero makes every resident block eligible for eviction.
 A resident block is a block that the cache currently stores.
 
-Python uses `random.sample`. C++ uses `std::sample`. Both functions sample
-without replacement. Each cache capacity starts with a new generator that uses
-the configured seed.
+Python uses `random.sample`. C++ draws random slot indices and rejects duplicates until it selects enough distinct slots.
+The sample contains at most the number of slots.
+Each variant and cache capacity starts with a new generator that uses the configured seed.
 
 Repeated runs in the same backend and runtime produce the same results.
 Python and C++ need not produce identical samples, evictions, or hit rates.
-C++ standard sampling scans the population.
 
 ## Trace timing
 
@@ -87,7 +102,8 @@ A prefix hole is the first missing block in that prefix.
 Reads count hits and refresh entries only before the first hole.
 
 At completion, the simulator writes the entire input in prefix order.
-It refreshes existing exact nodes and inserts missing nodes.
+Both variants insert missing nodes.
+Touch-on-put also refreshes existing exact nodes. Touch-on-get preserves their recency.
 It checks cache membership on each write.
 Writes can restore entries that the cache evicted while the request was in flight.
 
@@ -112,7 +128,7 @@ Each simulation uses a separate cache and random generator where applicable.
 `SequentialRequestScheduler` generates an arrival followed immediately by a completion for each request in file order.
 It stores only the event count and cursor.
 Its events use timestamp zero.
-A positive Sampled LRU threshold cannot expire entries while the clock stays at zero.
+A positive Sampling LRU threshold cannot expire entries while the clock stays at zero.
 Eviction therefore uses the threshold-halving fallback.
 A threshold of zero makes every sampled resident block eligible immediately.
 
@@ -183,10 +199,10 @@ order. Requests larger than the cache write one block at a time.
 
 ## Measurement
 
-Warmup and measurement use request counts. Sampled LRU must fill the cache
+Warmup and measurement use request counts. Each Sampling LRU variant must fill the cache
 before the first measured arrival. Mixed sweeps show unavailable results as
 `N/A`. These results do not suppress budget points for the existing policies.
-Sweeps that run only Sampled LRU omit underfilled budgets.
+Sweeps that select only one Sampling LRU variant omit underfilled budgets.
 
 Metadata includes the selected scheduler, replay modes, and policy parameters.
 The ceiling uses the selected scheduler.

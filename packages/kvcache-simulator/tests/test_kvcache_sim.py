@@ -421,7 +421,7 @@ int main() {
         self.assertEqual(single["hitTokens"], 2)
         self.assertEqual(all_results["lru-flat-touch-on-put"]["hitTokens"], 2)
         self.assertEqual(set(batch["points"][0]), {"cacheBlocks", "lru-flat-touch-on-put"})
-        self.assertEqual(set(default_batch["points"][0]), {"cacheBlocks", "fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal", "sampled-lru"})
+        self.assertEqual(set(default_batch["points"][0]), {"cacheBlocks", "fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal", "sampling-lru-touch-on-put", "sampling-lru-touch-on-get"})
 
 
 class FlatLruMemcacheTests(unittest.TestCase):

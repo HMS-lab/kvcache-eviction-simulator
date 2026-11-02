@@ -68,7 +68,7 @@ void shared_policy_scheduler() {
     RequestScheduler* selected = &RequestScheduler::get();
     assert((dynamic_cast<RecordedTimeScheduler*>(selected) != nullptr) == (options.scheduler == "recorded"));
     for (unsigned capacity : {1,99,0,1}) {
-      for (const auto* policy : {"ceiling","fifo","lru","lru-flat-touch-on-put","flat-lru-memcache","hyper-clock","optimal","sampled-lru"}) {
+      for (const auto* policy : {"ceiling","fifo","lru","lru-flat-touch-on-put","flat-lru-memcache","hyper-clock","optimal","sampling-lru-touch-on-put","sampling-lru-touch-on-get"}) {
         const auto result = runner.run(policy, capacity);
         assert(&RequestScheduler::get() == selected);
         if (capacity == 1) {
@@ -272,12 +272,12 @@ class NativeRequestSchedulerTests(unittest.TestCase):
             for capacity, point in zip(capacities,batch['points']):
                 single = run('--policy', 'all', '--capacity', str(capacity))
                 # Native all and batch expose the same named result payloads.
-                for policy in ('fifo','lru','lru-flat-touch-on-put','flat-lru-memcache','hyper-clock','optimal','sampled-lru'):
+                for policy in ('fifo','lru','lru-flat-touch-on-put','flat-lru-memcache','hyper-clock','optimal','sampling-lru-touch-on-put','sampling-lru-touch-on-get'):
                     self.assertEqual(point[policy], single[policy])
-                sampled = run('--policy', 'sampled-lru', '--capacity', str(capacity))
-                self.assertEqual(point['sampled-lru']['hitTokens'], sampled['hitTokens'])
-                self.assertEqual(point['sampled-lru']['measurementStartRequest'], sampled['measurementStartRequest'])
-            self.assertEqual(batch['points'][1]['sampled-lru']['measurementStartRequest'], -2)
+                sampled = run('--policy', 'sampling-lru-touch-on-put', '--capacity', str(capacity))
+                self.assertEqual(point['sampling-lru-touch-on-put']['hitTokens'], sampled['hitTokens'])
+                self.assertEqual(point['sampling-lru-touch-on-put']['measurementStartRequest'], sampled['measurementStartRequest'])
+            self.assertEqual(batch['points'][1]['sampling-lru-touch-on-put']['measurementStartRequest'], -2)
             run('--policy', 'batch', '--policies', 'lru', '--capacities', '1,2', expected=0)
             run('--policy', 'fifo', '--capacity', '1', expected=0)
 

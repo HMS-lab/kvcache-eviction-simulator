@@ -14,7 +14,7 @@ from typing import Callable, Iterable
 
 from .policies import PolicyResult, validate_hyper_clock_max_score
 from ._resources import package_resource_path, user_temp_suffix
-from .sampled import validate_parameters
+from .sampled import SAMPLING_POLICIES, validate_parameters
 from .trace import TraceData
 
 UINT32_MAX = 2**32 - 1
@@ -158,7 +158,7 @@ def run_cpp_sweep(
         raise ValueError(f"Unsupported scheduler: {scheduler}")
     threshold_us = (validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size,
                                         sampled_lru_seed, sampled_lru_max_evictions)
-                    if "sampled-lru" in policies else 10_000_000)
+                    if any(p in SAMPLING_POLICIES for p in policies) else 10_000_000)
     if scheduler == "recorded" and any(values is None or len(values) != trace.request_count for values in
                                        (trace.arrivals, trace.completions, trace.completion_order)):
         raise ValueError("recorded scheduler requires complete request timing data")
@@ -212,11 +212,11 @@ def run_cpp_sweep(
         if scheduler == "recorded":
             for flag, path in zip(("--request-arrivals", "--request-completions", "--request-order"), files.timing):
                 command.extend((flag, str(path)))
-        if "sampled-lru" in policies:
+        if any(p in SAMPLING_POLICIES for p in policies):
             command.extend(("--sampled-lru-threshold-us", str(threshold_us),
                             "--sampled-lru-sample-size", str(sampled_lru_sample_size),
                             "--sampled-lru-seed", str(sampled_lru_seed)))
-        if "sampled-lru" in policies and sampled_lru_max_evictions is not None:
+        if any(p in SAMPLING_POLICIES for p in policies) and sampled_lru_max_evictions is not None:
             command.extend(("--sampled-lru-max-evictions", str(sampled_lru_max_evictions)))
         if progress:
             command.append("--progress")

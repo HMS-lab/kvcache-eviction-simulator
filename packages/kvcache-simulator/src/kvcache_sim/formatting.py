@@ -38,11 +38,11 @@ def render_table(result: dict[str, Any], *, show_speedups: bool = False) -> str:
     if "hyper-clock" in policies:
         max_score = meta.get("policyParameters", {}).get("hyper-clock", {}).get("maxScore", 3)
         lines.insert(-1, f"Hyper Clock max score: {max_score}")
-    if "sampled-lru" in policies:
+    if any(p in policies for p in ("sampling-lru-touch-on-put", "sampling-lru-touch-on-get")):
         params = meta["sampledLruParameters"]
         eviction_limit = params.get("maxEvictions")
         eviction_limit = "all" if eviction_limit is None else eviction_limit
-        lines.insert(-1, f"Sampled LRU: threshold {params['thresholdSeconds']}s, sample {params['sampleSize']}, seed {params['seed']}, max evictions {eviction_limit}")
+        lines.insert(-1, f"Sampling LRU: threshold {params['thresholdSeconds']}s, sample {params['sampleSize']}, seed {params['seed']}, max evictions {eviction_limit}")
     for policy, reason in meta.get("skippedPolicies", {}).items():
         lines.insert(-1, f"Skipped {policy}: {reason}")
     headers = ["Budget", "Cache blocks"]
@@ -50,6 +50,8 @@ def render_table(result: dict[str, Any], *, show_speedups: bool = False) -> str:
         "lru": "LRU (prefix aware)",
         "lru-flat-touch-on-put": "Flat LRU (touch on put)",
         "flat-lru-memcache": "Flat LRU (memcache)",
+        "sampling-lru-touch-on-put": "Sampling LRU (touch on put)",
+        "sampling-lru-touch-on-get": "Sampling LRU (touch on get)",
     }
     for policy in policies:
         headers.append(f"{labels.get(policy, policy.upper())} hit")

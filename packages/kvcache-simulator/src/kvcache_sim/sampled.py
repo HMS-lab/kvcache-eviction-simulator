@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 from .trace import seconds_us
 
+SAMPLING_POLICIES = ("sampling-lru-touch-on-put", "sampling-lru-touch-on-get")
+
 
 def validate_parameters(threshold: float, sample_size: int, seed: int, max_evictions: int | None = None) -> int:
     threshold_us = seconds_us(threshold)
@@ -28,10 +30,11 @@ class Slot:
 
 
 class SampledCache:
-    def __init__(self, capacity: int, threshold_us: int, sample_size: int, seed: int, max_evictions: int | None = None):
+    def __init__(self, capacity: int, threshold_us: int, sample_size: int, seed: int, max_evictions: int | None = None, *, touch_on_put: bool = True):
         self.capacity, self.threshold, self.sample_size = capacity, threshold_us, sample_size
         validate_parameters(0, sample_size, seed, max_evictions)
         self.max_evictions = max_evictions
+        self.touch_on_put = touch_on_put
         self.rng = random.Random(seed)
         self.entries: dict[int, int] = {}
         self.slots: list[Slot | None] = []
@@ -72,7 +75,11 @@ class SampledCache:
             threshold //= 2
 
     def write(self, node: int, now: int) -> None:
-        if self.capacity <= 0 or self.lookup(node, now):
+        if self.capacity <= 0:
+            return
+        if node in self.entries:
+            if self.touch_on_put:
+                self.lookup(node, now)
             return
         if len(self.entries) == self.capacity:
             self.evict(now)
@@ -87,16 +94,17 @@ class SampledCache:
         self.entries[node] = index
 
 
-def simulate_sampled(plan, capacity, *, threshold=10.0, sample_size=16, seed=0, max_evictions=None):
+def simulate_sampled(plan, capacity, *, threshold=10.0, sample_size=16, seed=0, max_evictions=None, touch_on_put=True):
     # Local import avoids coupling legacy policy code to this scheduler.
     from .policies import _finish, _no_cache, _underfilled
     threshold_us = validate_parameters(threshold, sample_size, seed, max_evictions)
+    policy = SAMPLING_POLICIES[0 if touch_on_put else 1]
     if any(values is None or len(values) != plan.request_count for values in
            (plan.arrivals, plan.completions, plan.completion_order)):
-        raise ValueError("sampled-lru requires complete request timing data")
+        raise ValueError(f"{policy} requires complete request timing data")
     if capacity <= 0:
-        return _no_cache("sampled-lru", capacity, plan)
-    cache = SampledCache(capacity, threshold_us, sample_size, seed, max_evictions)
+        return _no_cache(policy, capacity, plan)
+    cache = SampledCache(capacity, threshold_us, sample_size, seed, max_evictions, touch_on_put=touch_on_put)
     pending = []
     cursor = hits = 0
     full = False
@@ -115,7 +123,7 @@ def simulate_sampled(plan, capacity, *, threshold=10.0, sample_size=16, seed=0, 
         complete(now)
         while cursor < plan.request_count and plan.arrivals[cursor] == now:
             if cursor >= plan.warmup_requests and not full:
-                return _underfilled("sampled-lru", capacity, plan)
+                return _underfilled(policy, capacity, plan)
             for event in range(plan.request_starts[cursor], plan.request_starts[cursor + 1]):
                 if not cache.lookup(plan.node_for_event[event], now):
                     break
@@ -125,5 +133,5 @@ def simulate_sampled(plan, capacity, *, threshold=10.0, sample_size=16, seed=0, 
             cursor += 1
         complete(now)
     if not full or plan.total_measured_tokens <= 0:
-        return _underfilled("sampled-lru", capacity, plan)
-    return _finish("sampled-lru", capacity, plan, hits, plan.total_measured_tokens)
+        return _underfilled(policy, capacity, plan)
+    return _finish(policy, capacity, plan, hits, plan.total_measured_tokens)

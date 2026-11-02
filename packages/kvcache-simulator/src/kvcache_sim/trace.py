@@ -211,7 +211,7 @@ def parse_trace_lines(
                 completions.clear()
                 keys.clear()
                 if timing_mode == "required":
-                    raise ValueError(f"sampled-lru requires valid timing: {timing_error}") from error
+                    raise ValueError(f"Recorded scheduling requires valid timing: {timing_error}") from error
         raw_requests.append((parsed_ids, input_length, explicit_block_tokens))
         request_count += 1
         raw_event_count += len(parsed_ids)

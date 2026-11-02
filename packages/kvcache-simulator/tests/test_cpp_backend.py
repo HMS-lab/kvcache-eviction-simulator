@@ -59,14 +59,14 @@ class NativeTraceHandoffTests(unittest.TestCase):
         updates = []
         result = run_cpp_sweep(
             make_trace(), scheduler="sequential", capacities=[4, 8, 4, -1],
-            policies=["hyper-clock", "sampled-lru"], warmup_requests=2,
+            policies=["hyper-clock", "sampling-lru-touch-on-put"], warmup_requests=2,
             progress=lambda done, total, label: updates.append((done, total, label)),
         )
         evaluations = [update for update in updates if " (cache capacity " in update[2]]
         expected_labels = [
             f"{policy} (cache capacity {capacity_index}/2, {capacity} blocks; policy {policy_index}/2)"
             for capacity_index, capacity in enumerate([4, 8], 1)
-            for policy_index, policy in enumerate(["sampled-lru", "hyper-clock"], 1)
+            for policy_index, policy in enumerate(["sampling-lru-touch-on-put", "hyper-clock"], 1)
         ]
         self.assertEqual([label for _, _, label in evaluations],
                          [label for label in expected_labels for _ in range(2)])
@@ -107,7 +107,7 @@ class NativeTraceHandoffTests(unittest.TestCase):
     def test_release_preserves_sweep_results_and_default_allows_reuse(self):
         trace = make_trace()
         kwargs = dict(model_id="qwen3-32b", precision="bf16_fp16", budgets_gib=[0.00025, 0.0005],
-                      backend="cpp", policies=[p for p in DEFAULT_POLICIES if p != "sampled-lru"])
+                      backend="cpp", policies=[p for p in DEFAULT_POLICIES if not p.startswith("sampling-lru-")])
         retained = run_sweep(trace, scheduler="sequential", **kwargs)
         self.assertEqual(len(trace.ids), 80)
         consumed = run_sweep(trace, scheduler="sequential", **kwargs, release_trace_data=True)

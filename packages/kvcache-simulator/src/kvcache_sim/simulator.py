@@ -9,11 +9,11 @@ from .calculator import BYTES_PER_GIB, calculate_cache_size, load_models_data, m
 from .cpp_backend import run_cpp_sweep
 from .plan import ExecutionPlan, build_execution_plan
 from .policies import PolicyResult, simulate_ceiling, simulate_policy, validate_hyper_clock_max_score
-from .sampled import validate_parameters
+from .sampled import SAMPLING_POLICIES, validate_parameters
 from .trace import TraceData
 
 DEFAULT_BUDGETS_GIB = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-DEFAULT_POLICIES = ["fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal", "sampled-lru"]
+DEFAULT_POLICIES = ["fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal", *SAMPLING_POLICIES]
 THROUGHPUT_EPSILON = 0.001
 THROUGHPUT_DISPLAY_CAP = 1000.0
 
@@ -143,15 +143,17 @@ def run_sweep(
                    sampled_lru_sample_size=sampled_lru_sample_size, sampled_lru_seed=sampled_lru_seed,
                    sampled_lru_max_evictions=sampled_lru_max_evictions)
     skipped = {}
-    if "sampled-lru" in selected_policies:
+    for policy in SAMPLING_POLICIES:
+        if policy not in selected_policies:
+            continue
         validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size,
                             sampled_lru_seed, sampled_lru_max_evictions)
         if backend == "python":
-            reason = "sampled-lru with sequential scheduling requires the C++ backend"
+            reason = f"{policy} with sequential scheduling requires the C++ backend"
             if policies:
-                raise ValueError(f"sampled-lru: {reason}")
-            skipped["sampled-lru"] = reason
-            selected_policies.remove("sampled-lru")
+                raise ValueError(f"{policy}: {reason}")
+            skipped[policy] = reason
+            selected_policies.remove(policy)
     for policy in selected_policies:
         if policy not in DEFAULT_POLICIES:
             raise ValueError(f"Unsupported policy: {policy}")
@@ -216,7 +218,7 @@ def run_sweep(
             else:
                 result = sim_results[(policy, capacity)]
             if result.measurementMode == "underfilled_at_window":
-                if policy != "sampled-lru" or len(selected_policies) == 1:
+                if policy not in SAMPLING_POLICIES or len(selected_policies) == 1:
                     underfilled = True
             result_json = result.to_json()
             result_json["idealPrefillSpeedup"] = throughput_from_hit_rate(result.hitRate)
@@ -236,7 +238,7 @@ def run_sweep(
             "ceilingReplayMode": scheduler,
             **({"sampledLruParameters": {"thresholdSeconds": sampled_lru_threshold_seconds,
                 "sampleSize": sampled_lru_sample_size, "seed": sampled_lru_seed,
-                "maxEvictions": sampled_lru_max_evictions}} if "sampled-lru" in selected_policies else {}),
+                "maxEvictions": sampled_lru_max_evictions}} if any(p in SAMPLING_POLICIES for p in selected_policies) else {}),
             "modelId": cache_size.model_id,
             "modelLabel": cache_size.model_label,
             "precision": cache_size.precision,
@@ -258,7 +260,7 @@ def run_sweep(
             "measurementWindow": "last_50_percent_requests" if warmup_fraction == 0.5 else f"last_{max(0.0, 1.0 - warmup_fraction):.6f}_fraction_requests",
             "underfilledBudgetPolicy": "omit_budget_and_larger_points",
             **({"sampledLruUnderfilledPolicy": "mark_unavailable_preserve_legacy_points"}
-               if "sampled-lru" in selected_policies and len(selected_policies) > 1 else {}),
+               if any(p in SAMPLING_POLICIES for p in selected_policies) and len(selected_policies) > 1 else {}),
             "speedupBaseline": "1.0x equals no-cache prefill throughput where every prefill input token is computed.",
             "totalMeasuredTokens": total_measured_tokens,
             "averageInputTokens": trace.average_input_tokens,

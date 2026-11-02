@@ -470,12 +470,13 @@ def simulate_policy(
     sampled_lru_max_evictions: int | None = None,
 ) -> PolicyResult:
     validate_hyper_clock_max_score(hyper_clock_max_score)
-    if policy == "sampled-lru":
+    if policy in {"sampling-lru-touch-on-put", "sampling-lru-touch-on-get"}:
         from .sampled import simulate_sampled
         return simulate_sampled(
             plan, capacity, threshold=sampled_lru_threshold_seconds,
             sample_size=sampled_lru_sample_size, seed=sampled_lru_seed,
             max_evictions=sampled_lru_max_evictions,
+            touch_on_put=policy == "sampling-lru-touch-on-put",
         )
     if policy == "fifo":
         return simulate_fifo(plan, capacity)

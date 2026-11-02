@@ -19,7 +19,7 @@ from kvcache_sim.cpp_backend import run_cpp_sweep, ensure_cpp_simulator, _write_
 from kvcache_sim.simulator import run_sweep, DEFAULT_POLICIES
 from kvcache_sim.formatting import render_table
 
-LEGACY = [p for p in DEFAULT_POLICIES if p != 'sampled-lru']
+LEGACY = [p for p in DEFAULT_POLICIES if not p.startswith('sampling-lru-')]
 
 
 def trace(requests, **kwargs):
@@ -158,8 +158,8 @@ class ReplayTests(unittest.TestCase):
         args = dict(model_id='qwen3-32b', budgets_gib=[0.00025], backend='python', scheduler='sequential')
         r = run_sweep(t, **args)
         self.assertEqual(r['policies'], LEGACY)
-        self.assertIn('sampled-lru', r['metadata']['skippedPolicies'])
-        with self.assertRaises(ValueError): run_sweep(t, policies=['sampled-lru'], **args)
+        self.assertIn('sampling-lru-touch-on-put', r['metadata']['skippedPolicies'])
+        with self.assertRaises(ValueError): run_sweep(t, policies=['sampling-lru-touch-on-put'], **args)
 
     def test_legacy_results_and_budget_points_unchanged(self):
         t = trace([(0, 10, ['A']), (1, 10, ['B']), (2, 11, ['A']), (3, 12, ['B'])])
@@ -196,8 +196,8 @@ class ReplayTests(unittest.TestCase):
             path.write_text('\n'.join(json.dumps(r) for r in records))
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             self.assertEqual(json.loads(result.stdout)['policies'], LEGACY)
-            self.assertIn('Skipping sampled-lru', result.stderr)
-            self.assertNotEqual(subprocess.run(cmd + ['--policies','sampled-lru'], capture_output=True).returncode, 0)
+            self.assertIn('Skipping sampling-lru-touch-on-put', result.stderr)
+            self.assertNotEqual(subprocess.run(cmd + ['--policies','sampling-lru-touch-on-put'], capture_output=True).returncode, 0)
 
     def test_parameter_validation(self):
         p = build_execution_plan(trace([(0,1,['A']), (2,3,['A'])]))
@@ -228,10 +228,10 @@ class NativeTests(unittest.TestCase):
             with self.subTest(limit=limit):
                 expected = simulate_sampled(p, 3, max_evictions=limit)
                 native = run_cpp_sweep(t, scheduler='recorded', capacities=[3],
-                                       policies=['sampled-lru'], warmup_requests=p.warmup_requests,
+                                       policies=['sampling-lru-touch-on-put'], warmup_requests=p.warmup_requests,
                                        sampled_lru_max_evictions=limit)
-                self.assertEqual(expected, native.results['sampled-lru', 3])
-                self.assertEqual(expected, simulate_policy(p, 'sampled-lru', 3,
+                self.assertEqual(expected, native.results['sampling-lru-touch-on-put', 3])
+                self.assertEqual(expected, simulate_policy(p, 'sampling-lru-touch-on-put', 3,
                                                           sampled_lru_max_evictions=limit))
         self.assertNotEqual(simulate_sampled(p, 3), simulate_sampled(p, 3, max_evictions=1))
 
@@ -242,7 +242,7 @@ class NativeTests(unittest.TestCase):
                 hash_ids=['A'], input_length=1, block_size=1)) for i in range(4)))
             cmd = [sys.executable, '-m', 'kvcache_sim', 'run', '--trace', str(path),
                    '--model', 'qwen3-32b', '--budgets-gib', '0.00025', '--scheduler', 'recorded',
-                   '--policies', 'sampled-lru', '--format', 'json', '--no-progress']
+                   '--policies', 'sampling-lru-touch-on-put', '--format', 'json', '--no-progress']
             result = subprocess.run(cmd + ['--sampled-lru-max-evictions', '1'],
                                     capture_output=True, text=True, check=True)
             parsed = json.loads(result.stdout)
@@ -251,6 +251,15 @@ class NativeTests(unittest.TestCase):
             for invalid in ('0', '-1', '4294967296', '1.5'):
                 self.assertNotEqual(subprocess.run(cmd + ['--sampled-lru-max-evictions', invalid],
                                                   capture_output=True).returncode, 0)
+            get_cmd = [value.replace('sampling-lru-touch-on-put', 'sampling-lru-touch-on-get')
+                       for value in cmd]
+            result = subprocess.run(get_cmd + ['--sampled-lru-max-evictions', '1'],
+                                    capture_output=True, text=True, check=True)
+            parsed = json.loads(result.stdout)
+            self.assertEqual(parsed['policies'], ['sampling-lru-touch-on-get'])
+            self.assertEqual(parsed['metadata']['sampledLruParameters']['maxEvictions'], 1)
+            self.assertIn('Sampling LRU (touch on get)', render_table(parsed))
+            self.assertIn('max evictions 1', render_table(parsed))
             native = str(ensure_cpp_simulator())
             for invalid in ('0', '-1', '4294967296', '1.5'):
                 result = subprocess.run([native, '--sampled-lru-max-evictions', invalid],
@@ -269,7 +278,7 @@ class NativeTests(unittest.TestCase):
             self.assertTrue(all(r() is None for r in refs))
             return original(*a, **kw)
         with patch('kvcache_sim.cpp_backend.subprocess.Popen', side_effect=launch):
-            run_cpp_sweep(t, scheduler="recorded", capacities=[1], policies=['sampled-lru'], warmup_requests=2, release_trace_data=True)
+            run_cpp_sweep(t, scheduler="recorded", capacities=[1], policies=['sampling-lru-touch-on-put'], warmup_requests=2, release_trace_data=True)
         self.assertEqual(t.ids, [])
 
     def test_native_batch_eviction_and_fallback(self):
@@ -294,6 +303,25 @@ int main() {
           assert(sampled.slots.at(sampled.node_to_slot[node]).node == node);
       }
     }
+  }
+  // Existing puts must preserve both timestamp and tie-breaking sequence.
+  for (bool touch : {false, true}) {
+    Options recency; recency.sampled_threshold = 10; recency.sampled_size = 2;
+    SampledCache cache(2, recency, 4, touch);
+    cache.write(1, 0); cache.write(2, 1);
+    const auto original = cache.slots[cache.node_to_slot[1]];
+    const auto sequence = cache.sequence;
+    cache.write(1, 20);
+    const auto updated = cache.slots[cache.node_to_slot[1]];
+    assert(updated.timestamp == (touch ? 20 : original.timestamp));
+    assert(updated.sequence == (touch ? sequence + 1 : original.sequence));
+    assert(cache.sequence == sequence + (touch ? 1 : 0));
+    assert(cache.lookup(1, 21));
+    assert(cache.slots[cache.node_to_slot[1]].timestamp == 21);
+    cache.write(3, 22);
+    assert(cache.contains(1) && cache.contains(3) && !cache.contains(2));
+    cache.write(2, 23);
+    assert(cache.slots[cache.node_to_slot[2]].timestamp == 23);
   }
   // An evicted node must miss, and reinsertion must restore its mapping.
   Options reuse_options; reuse_options.sampled_threshold = 0;
@@ -343,6 +371,29 @@ int main() {
             subprocess.run(['c++','-std=c++17','-O0',str(cpp),'-o',str(binary)], check=True, capture_output=True)
             subprocess.run([str(binary)], check=True, timeout=10)
 
+    def test_touch_on_get_preserves_recency_at_delayed_completion(self):
+        # Both A requests miss at time 0. The second finishes after B is inserted.
+        # Its completion refreshes A only for touch-on-put. C then evicts B in
+        # that variant, but evicts A for touch-on-get. The final B read differs.
+        t = trace([(0,1,['A']), (0,10,['A']), (2,3,['B']),
+                   (11,12,['C']), (13,14,['B'])])
+        policies = ['sampling-lru-touch-on-put', 'sampling-lru-touch-on-get']
+        result = run_cpp_sweep(t, scheduler='recorded', capacities=[2, 0, 2],
+                               policies=policies, warmup_requests=3,
+                               sampled_lru_threshold_seconds=10,
+                               sampled_lru_sample_size=2, sampled_lru_max_evictions=1)
+        for policy, hits in zip(policies, [0, 1]):
+            actual = result.results[policy, 2]
+            self.assertEqual((actual.hitTokens, actual.totalTokens), (hits, 2))
+            self.assertEqual(actual.policy, policy)
+            self.assertEqual(result.results[policy, 0].hitTokens, 0)
+        # Selection of the new variant alone must still forward sampling options.
+        alone = run_cpp_sweep(t, scheduler='recorded', capacities=[2],
+                              policies=[policies[1]], warmup_requests=3,
+                              sampled_lru_threshold_seconds=10,
+                              sampled_lru_sample_size=2, sampled_lru_max_evictions=1)
+        self.assertEqual(alone.results[policies[1], 2], result.results[policies[1], 2])
+
     def test_native_overlapping_and_zero_duration_events(self):
         for requests in [
             [(0,1,['W']), (0,5,['A']), (2,6,['A']), (5,7,['A'])],
@@ -352,12 +403,12 @@ int main() {
             t = trace(requests)
             t.completion_order = [1,0,2,3]
             expected = simulate_sampled(build_execution_plan(t), 1)
-            actual = run_cpp_sweep(t, scheduler="recorded", capacities=[1], policies=['sampled-lru'], warmup_requests=2)
-            self.assertEqual(expected, actual.results['sampled-lru',1])
+            actual = run_cpp_sweep(t, scheduler="recorded", capacities=[1], policies=['sampling-lru-touch-on-put'], warmup_requests=2)
+            self.assertEqual(expected, actual.results['sampling-lru-touch-on-put',1])
 
     def test_seed_reproducible_with_small_samples(self):
         t = trace([(i*2, i*2+1, [i%5, (i+1)%5]) for i in range(20)])
-        kw = dict(capacities=[3], policies=['sampled-lru'], warmup_requests=10,
+        kw = dict(capacities=[3], policies=['sampling-lru-touch-on-put'], warmup_requests=10,
                   sampled_lru_threshold_seconds=0, sampled_lru_sample_size=2, sampled_lru_seed=123)
         self.assertEqual(run_cpp_sweep(t, scheduler="recorded", **kw), run_cpp_sweep(t, scheduler="recorded", **kw))
         p = build_execution_plan(t)
@@ -368,7 +419,7 @@ int main() {
         t = trace([(0,1,['A']), (2,3,['A'])])
         with tempfile.TemporaryDirectory() as tmp:
             f = _write_binary_trace(t, Path(tmp))
-            cmd = [str(ensure_cpp_simulator()), '--scheduler','recorded','--policy','sampled-lru','--ids',str(f.ids),'--tokens',str(f.tokens),
+            cmd = [str(ensure_cpp_simulator()), '--scheduler','recorded','--policy','sampling-lru-touch-on-put','--ids',str(f.ids),'--tokens',str(f.tokens),
                    '--request-ends',str(f.request_ends),'--request-count','2','--total-blocks','2','--capacity','1']
             self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode, 0)
             for flag,path in zip(('--request-arrivals','--request-completions','--request-order'), f.timing): cmd += [flag,str(path)]

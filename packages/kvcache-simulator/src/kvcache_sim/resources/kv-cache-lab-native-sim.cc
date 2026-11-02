@@ -152,7 +152,7 @@ Options parse_args(int argc, char** argv) {
     else throw std::runtime_error("Unknown argument: " + arg);
   }
   if (options.policy.empty() || options.ids_path.empty() || options.tokens_path.empty() || options.total_blocks == 0) {
-    throw std::runtime_error("Usage: kv-cache-lab-native-sim --scheduler recorded|sequential --policy fifo|lru|lru-flat-touch-on-put|flat-lru-memcache|hyper-clock|optimal|sampled-lru|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--hyper-clock-max-score N] [--next PATH]");
+    throw std::runtime_error("Usage: kv-cache-lab-native-sim --scheduler recorded|sequential --policy fifo|lru|lru-flat-touch-on-put|flat-lru-memcache|hyper-clock|optimal|sampling-lru-touch-on-put|sampling-lru-touch-on-get|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--hyper-clock-max-score N] [--next PATH]");
   }
   if (options.policy != "build-next" && (options.request_ends_path.empty() || options.request_count == 0)) {
     throw std::runtime_error("--request-ends and --request-count are required");
@@ -1038,13 +1038,14 @@ struct SampledSlot {
 struct SampledCache {
   std::uint32_t capacity, sample_size, max_evictions;
   std::uint64_t threshold, sequence = 0;
+  bool touch_on_put;
   std::mt19937_64 rng;
   std::vector<SampledSlot> slots;
   std::vector<std::size_t> free;
   static constexpr std::uint32_t absent = 0xffffffffU;
   std::vector<std::uint32_t> node_to_slot;
-  SampledCache(std::uint32_t cap, const Options& o, std::size_t node_count)
-      : capacity(cap), sample_size(o.sampled_size), max_evictions(o.sampled_max_evictions), threshold(o.sampled_threshold), rng(o.sampled_seed), node_to_slot(node_count, absent) {}
+  SampledCache(std::uint32_t cap, const Options& o, std::size_t node_count, bool touch_on_put = true)
+      : capacity(cap), sample_size(o.sampled_size), max_evictions(o.sampled_max_evictions), threshold(o.sampled_threshold), touch_on_put(touch_on_put), rng(o.sampled_seed), node_to_slot(node_count, absent) {}
   std::size_t size() const { return slots.size() - free.size(); }
   bool contains(std::uint32_t node) const { return node_to_slot[node] != absent; }
   bool lookup(std::uint32_t node, std::uint64_t now) {
@@ -1088,7 +1089,11 @@ struct SampledCache {
     }
   }
   void write(std::uint32_t node, std::uint64_t now) {
-    if (!capacity || lookup(node, now)) return;
+    if (!capacity) return;
+    if (contains(node)) {
+      if (touch_on_put) lookup(node, now);
+      return;
+    }
     if (size() == capacity) evict(now);
     std::size_t index;
     if (free.empty()) { index = slots.size(); slots.push_back({}); }
@@ -1097,14 +1102,14 @@ struct SampledCache {
   }
 };
 
-Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, const Options& options) {
+Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, const Options& options, bool touch_on_put = true) {
   auto& scheduler = RequestScheduler::get();
   if (!capacity) {
     scheduler.discard_remaining();
     scheduler.reset();
     return no_cache_result(input, options);
   }
-  SampledCache cache(capacity, options, input.prefix.parent.size());
+  SampledCache cache(capacity, options, input.prefix.parent.size(), touch_on_put);
   Result result;
   result.measurement_start_request = options.warmup_requests;
   bool full = false;
@@ -1146,6 +1151,7 @@ struct AllResults {
   Result hyper_clock;
   Result optimal;
   Result sampled;
+  Result sampled_get;
 };
 
 bool has_policy(const Options& options, const std::string& policy) {
@@ -1155,7 +1161,7 @@ bool has_policy(const Options& options, const std::string& policy) {
 
 std::uint64_t selected_policy_count(const Options& options) {
   std::uint64_t count = 0;
-  for (const auto* policy : {"sampled-lru", "fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal"}) {
+  for (const auto* policy : {"sampling-lru-touch-on-put", "sampling-lru-touch-on-get", "fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal"}) {
     if (has_policy(options, policy)) ++count;
   }
   return count;
@@ -1207,8 +1213,11 @@ void print_all_results(std::uint64_t cache_blocks, const AllResults& results, st
   std::cout << "},\"optimal\":{";
   print_named_result("optimal", cache_blocks, results.optimal, warmup_requests);
   std::cout << "}";
-  std::cout << ",\"sampled-lru\":{";
-  print_named_result("sampled-lru", cache_blocks, results.sampled, warmup_requests);
+  std::cout << ",\"sampling-lru-touch-on-put\":{";
+  print_named_result("sampling-lru-touch-on-put", cache_blocks, results.sampled, warmup_requests);
+  std::cout << "}";
+  std::cout << ",\"sampling-lru-touch-on-get\":{";
+  print_named_result("sampling-lru-touch-on-get", cache_blocks, results.sampled_get, warmup_requests);
   std::cout << "}";
   std::cout << "}\n";
 }
@@ -1230,7 +1239,8 @@ class SimulationRunner {
       : input(input), options(options), scheduler(make_scheduler(input, options)) {}
 
   Result run(const std::string& policy, std::uint32_t capacity) {
-    if (policy == "sampled-lru") return simulate_sampled(input, capacity, options);
+    if (policy == "sampling-lru-touch-on-put") return simulate_sampled(input, capacity, options);
+    if (policy == "sampling-lru-touch-on-get") return simulate_sampled(input, capacity, options, false);
     if (policy == "ceiling") return simulate_ceiling(input, options);
     if (policy == "fifo") return simulate_fifo(input, capacity, options);
     if (policy == "lru") return simulate_trie_policy(input, capacity, false, options);
@@ -1245,7 +1255,7 @@ class SimulationRunner {
     return {
       run("fifo", capacity), run("lru", capacity), run("lru-flat-touch-on-put", capacity), run("flat-lru-memcache", capacity),
       run("hyper-clock", capacity), run("optimal", capacity),
-      run("sampled-lru", capacity),
+      run("sampling-lru-touch-on-put", capacity), run("sampling-lru-touch-on-get", capacity),
     };
   }
 
@@ -1290,8 +1300,11 @@ class SimulationRunner {
       Result hyper_clock;
       Result optimal;
       Result sampled;
-      const bool run_sampled = has_policy(options, "sampled-lru");
-      if (run_sampled) sampled = evaluate("sampled-lru");
+      Result sampled_get;
+      const bool run_sampled = has_policy(options, "sampling-lru-touch-on-put");
+      if (run_sampled) sampled = evaluate("sampling-lru-touch-on-put");
+      const bool run_sampled_get = has_policy(options, "sampling-lru-touch-on-get");
+      if (run_sampled_get) sampled_get = evaluate("sampling-lru-touch-on-get");
       if (has_policy(options, "fifo")) fifo = evaluate("fifo");
       if (has_policy(options, "lru")) lru = evaluate("lru");
       if (has_policy(options, "lru-flat-touch-on-put")) flat_lru_touch_on_put = evaluate("lru-flat-touch-on-put");
@@ -1334,8 +1347,13 @@ class SimulationRunner {
         std::cout << "}";
       }
       if (run_sampled) {
-        std::cout << ",\"sampled-lru\":{";
-        print_named_result("sampled-lru", capacity, sampled, options.warmup_requests);
+        std::cout << ",\"sampling-lru-touch-on-put\":{";
+        print_named_result("sampling-lru-touch-on-put", capacity, sampled, options.warmup_requests);
+        std::cout << "}";
+      }
+      if (run_sampled_get) {
+        std::cout << ",\"sampling-lru-touch-on-get\":{";
+        print_named_result("sampling-lru-touch-on-get", capacity, sampled_get, options.warmup_requests);
         std::cout << "}";
       }
       std::cout << "}";
