@@ -2,6 +2,25 @@
 
 `kvcache-simulator` runs the KVCache.AI hit-rate simulator locally on JSONL traces. It uses the same model accounting formulas as the KV Cache Size Calculator and the same prefix-aware hit-rate semantics as the KV Cache Hit Rate Simulator.
 
+## Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Input Trace Format](#input-trace-format)
+- [Converting SemiAnalysis Conversation Traces](#converting-semianalysis-conversation-traces)
+- [Request schedulers](#request-schedulers)
+- [Options](#options)
+- [Output Semantics](#output-semantics)
+  - [Flat LRU (memcache)](#flat-lru-memcache)
+  - [Hyper Clock](#hyper-clock)
+    - [Clock examples](#clock-examples)
+    - [Prefix holes and suffix writes](#prefix-holes-and-suffix-writes)
+  - [Measurement for all policies](#measurement-for-all-policies)
+- [Performance Notes](#performance-notes)
+- [Limits](#limits)
+- [Development](#development)
+  - [Sampling LRU variants and recorded-time replay](#sampling-lru-variants-and-recorded-time-replay)
+
 ## Installation
 
 ```bash
