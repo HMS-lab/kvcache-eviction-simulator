@@ -519,7 +519,7 @@ int main() {
                                    check=True, capture_output=True, text=True, cwd=PACKAGE_ROOT).stdout
             self.assertIn("Hyper Clock max score: 7", table)
             self.assertIn("HYPER-CLOCK hit", table)
-            self.assertIn("HYPER-CLOCK speedup", table)
+            self.assertNotIn("HYPER-CLOCK speedup", table)
 
 
 if __name__ == "__main__":

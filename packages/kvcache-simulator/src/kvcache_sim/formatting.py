@@ -18,7 +18,7 @@ def format_number(value: float) -> str:
     return f"{value:,.2f}"
 
 
-def render_table(result: dict[str, Any]) -> str:
+def render_table(result: dict[str, Any], *, show_speedups: bool = False) -> str:
     meta = result["metadata"]
     policies = result.get("policies") or ["fifo", "lru", "optimal"]
     lines = [
@@ -30,9 +30,11 @@ def render_table(result: dict[str, Any]) -> str:
         f"Replay: all policies and the ceiling use {meta['scheduler']} scheduling.",
         f"Hit rate ceiling: {format_percent(result['hitRateCeiling'])}",
         "Measurement: hit rates use the last 50% of requests; budget points that do not fill the cache before this window are omitted.",
-        "Speedup: 1.0x means no-cache prefill throughput where every prefill input token is computed.",
         "",
     ]
+    if show_speedups:
+        lines.insert(-1, "Speedup: 1.0x means no-cache prefill throughput where every prefill input token is computed.")
+        lines.insert(-1, "Speedup is a theoretical prefill bound, not measured latency or throughput.")
     if "hyper-clock" in policies:
         max_score = meta.get("policyParameters", {}).get("hyper-clock", {}).get("maxScore", 3)
         lines.insert(-1, f"Hyper Clock max score: {max_score}")
@@ -41,7 +43,6 @@ def render_table(result: dict[str, Any]) -> str:
         eviction_limit = params.get("maxEvictions")
         eviction_limit = "all" if eviction_limit is None else eviction_limit
         lines.insert(-1, f"Sampled LRU: threshold {params['thresholdSeconds']}s, sample {params['sampleSize']}, seed {params['seed']}, max evictions {eviction_limit}")
-        lines.insert(-1, "Speedup is an ideal prefill bound, not measured latency or throughput.")
     for policy, reason in meta.get("skippedPolicies", {}).items():
         lines.insert(-1, f"Skipped {policy}: {reason}")
     headers = ["Budget", "Cache blocks"]
@@ -51,17 +52,19 @@ def render_table(result: dict[str, Any]) -> str:
     }
     for policy in policies:
         headers.append(f"{labels.get(policy, policy.upper())} hit")
-    for policy in policies:
-        headers.append(f"{labels.get(policy, policy.upper())} speedup")
+    if show_speedups:
+        for policy in policies:
+            headers.append(f"{labels.get(policy, policy.upper())} speedup")
     rows: list[list[str]] = []
     for point in result.get("points", []):
         row = [f"{format_number(point['gib'])} GiB", format_number(point["cacheBlocks"])]
         for policy in policies:
             result = point["results"][policy]
             row.append("N/A" if result["measurementMode"] == "underfilled_at_window" else format_percent(result["hitRate"]))
-        for policy in policies:
-            result = point["results"][policy]
-            row.append("N/A" if result["measurementMode"] == "underfilled_at_window" else format_speedup(result["idealPrefillSpeedup"]))
+        if show_speedups:
+            for policy in policies:
+                result = point["results"][policy]
+                row.append("N/A" if result["measurementMode"] == "underfilled_at_window" else format_speedup(result["idealPrefillSpeedup"]))
         rows.append(row)
     if not rows:
         lines.append("No budget point reached cache pressure before the 50% measurement window.")

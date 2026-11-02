@@ -607,6 +607,15 @@ class SweepAndCliTests(unittest.TestCase):
             ]
 
             table = subprocess.run(base, cwd=Path(__file__).resolve().parents[1], check=True, text=True, capture_output=True)
+            speedups = subprocess.run(base + ["--show-speedups"], cwd=PACKAGE_ROOT, check=True, text=True, capture_output=True)
+            run_base = base.copy()
+            run_base[3] = "run"
+            run_speedups = subprocess.run(run_base + ["--show-speedups"], cwd=PACKAGE_ROOT, check=True, text=True, capture_output=True)
+            self.assertEqual(speedups.stdout, run_speedups.stdout)
+            for command in ("run", "sweep"):
+                help_output = subprocess.run([sys.executable, "-m", "kvcache_sim", command, "--help"], cwd=PACKAGE_ROOT, check=True, text=True, capture_output=True).stdout
+                self.assertIn("--show-speedups", help_output)
+                self.assertIn("theoretical", help_output)
             as_json = subprocess.run(base + ["--format", "json"], cwd=Path(__file__).resolve().parents[1], check=True, text=True, capture_output=True)
             memcache_selected = subprocess.run(base + ["--policies", "flat-lru-memcache", "--format", "json"], cwd=PACKAGE_ROOT, check=True, text=True, capture_output=True)
             selected = subprocess.run(base + ["--policies", "lru-flat-touch-on-put", "--format", "json"], cwd=PACKAGE_ROOT, check=True, text=True, capture_output=True)
@@ -618,13 +627,14 @@ class SweepAndCliTests(unittest.TestCase):
         self.assertIn("Budget", table.stdout)
         self.assertIn("FIFO hit", table.stdout)
         self.assertIn("Flat LRU (memcache) hit", table.stdout)
-        self.assertIn("Flat LRU (memcache) speedup", table.stdout)
+        self.assertNotIn("speedup", table.stdout.lower())
+        self.assertIn("Flat LRU (memcache) speedup", speedups.stdout)
         self.assertIn("Flat LRU (touch on put) hit", table.stdout)
-        self.assertIn("Flat LRU (touch on put) speedup", table.stdout)
+        self.assertIn("Flat LRU (touch on put) speedup", speedups.stdout)
         parsed = json.loads(as_json.stdout)
         self.assertEqual(parsed["policies"], ["fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal"])
         self.assertIn("HYPER-CLOCK hit", table.stdout)
-        self.assertIn("HYPER-CLOCK speedup", table.stdout)
+        self.assertIn("HYPER-CLOCK speedup", speedups.stdout)
         self.assertIn("Hyper Clock max score: 3", table.stdout)
         self.assertIn("idealPrefillSpeedup", parsed["points"][0]["results"]["lru-flat-touch-on-put"])
         memcache_result = json.loads(memcache_selected.stdout)
@@ -636,7 +646,8 @@ class SweepAndCliTests(unittest.TestCase):
         self.assertEqual(parsed["metadata"]["modelId"], "qwen3-32b")
         self.assertEqual(parsed["points"][0]["cacheBlocks"], 1)
         self.assertIn("Measurement: hit rates use the last 50% of requests", table.stdout)
-        self.assertIn("Speedup: 1.0x means no-cache prefill throughput", table.stdout)
+        self.assertIn("Speedup: 1.0x means no-cache prefill throughput", speedups.stdout)
+        self.assertIn("theoretical prefill bound", speedups.stdout)
 
     def test_cli_run_command_matches_sweep_alias(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

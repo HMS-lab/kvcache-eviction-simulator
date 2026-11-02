@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--jobs", type=int, default=1, help="Worker processes for the Python backend; ignored by the C++ backend")
         command.add_argument("--no-progress", action="store_true", help="Disable terminal progress output")
         command.add_argument("--format", choices=["table", "json"], default="table", help="Output format (default: table)")
+        command.add_argument("--show-speedups", action="store_true", help="Show theoretical prefill speedup columns in table output (not measured latency or throughput; disabled by default)")
         command.add_argument("--output", "-o", default="-", help="Output path, or - for stdout")
         command.add_argument("--models-yaml", default=None, help="Override models.yaml path")
         command.add_argument("--max-records", type=int, default=0, help="Stop after this many valid requests (debug/testing)")
@@ -112,7 +113,7 @@ def run_sweep_command(args: argparse.Namespace) -> int:
         )
         for policy, reason in result["metadata"].get("skippedPolicies", {}).items():
             print(f"Skipping {policy}: {reason}", file=sys.stderr)
-        rendered = render_json(result) if args.format == "json" else render_table(result)
+        rendered = render_json(result) if args.format == "json" else render_table(result, show_speedups=args.show_speedups)
         _write_output(rendered, args.output)
         progress.finish()
         return 0

@@ -191,6 +191,7 @@ Python API calls to `run_sweep()` and `run_cpp_sweep()` also require `scheduler=
 | `--jobs N` | Number of worker processes for the Python backend. The C++ backend runs one batch process and ignores this option. |
 | `--no-progress` | Disable terminal progress output. Progress is written to stderr only when stderr is interactive, so JSON stdout stays valid. |
 | `--format table\|json` | Output format. Default is `table`. |
+| `--show-speedups` | Show theoretical prefill speedup columns in table output. Disabled by default; these are bounds, not measured latency or throughput. JSON results always include speedup values. |
 | `--output PATH` | Write output to a file. Default `-` prints to stdout. |
 | `--max-records N` | Debug/testing limit: stop after N valid requests. |
 | `--max-events N` | Debug/testing limit: stop after N trace blocks. |
@@ -201,7 +202,7 @@ All policies use prefix-specific block identities: the same raw block ID under d
 
 Flat LRU (touch on put) processes each request with separate read and write passes. Reading refreshes only the continuous cached prefix, stopping at the first miss. Writing visits the complete request in prefix order: an exact cached node is refreshed, and a missing node is inserted, evicting the least recent entry when full. A matching raw block ID under another prefix is a different entry. The writer checks current membership even for blocks read earlier. Tail insertion may evict the head of the same request; the writer makes one pass without restarting repairs. Recency follows access order, not timestamps.
 
-Flat LRU (touch on put) appears as `Flat LRU (touch on put) hit` and `Flat LRU (touch on put) speedup` in the default table and as `lru-flat-touch-on-put` in JSON results. To run only this policy, add `--policies lru-flat-touch-on-put` with either backend.
+Flat LRU (touch on put) appears as `Flat LRU (touch on put) hit` in the default table, with `Flat LRU (touch on put) speedup` added by `--show-speedups`, and as `lru-flat-touch-on-put` in JSON results. To run only this policy, add `--policies lru-flat-touch-on-put` with either backend.
 
 ### Flat LRU (memcache)
 
@@ -234,7 +235,7 @@ kvcache-simulator run \
   --hyper-clock-max-score 3
 ```
 
-The table includes `HYPER-CLOCK hit`, `HYPER-CLOCK speedup`, and the configured maximum score. JSON results use `hyper-clock`, with the configuration in `metadata.policyParameters["hyper-clock"].maxScore`.
+The table includes `HYPER-CLOCK hit` and the configured maximum score. Add `--show-speedups` to include `HYPER-CLOCK speedup`. JSON results use `hyper-clock`, with the configuration in `metadata.policyParameters["hyper-clock"].maxScore`.
 
 #### Clock examples
 
