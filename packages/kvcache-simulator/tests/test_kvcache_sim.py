@@ -14,7 +14,7 @@ from pathlib import Path
 from kvcache_sim.calculator import calculate_cache_size, load_models_data, models_by_id
 from kvcache_sim.cpp_backend import _build_path_for_source, _write_binary_trace, ensure_cpp_simulator, run_cpp_sweep
 from kvcache_sim.plan import build_execution_plan
-from kvcache_sim.policies import _FlatLruTouchOnPutCache, _read_flat_lru_touch_on_put_prefix, _write_flat_lru_touch_on_put_request, simulate_policy
+from kvcache_sim.policies import _FlatLruCache, _read_flat_lru_prefix, _write_flat_lru_request, simulate_policy
 from kvcache_sim._resources import package_resource_path, user_temp_suffix
 from kvcache_sim.simulator import run_sweep
 from kvcache_sim.trace import parse_trace_file, parse_trace_lines
@@ -256,16 +256,16 @@ class FlatLruTouchOnPutTests(unittest.TestCase):
         plan = build_execution_plan(make_trace(["X"], ["D", "C"], ["A", "B", "C"]))
         x, _d, other_c, a, b, c = plan.node_for_event
         self.assertNotEqual(other_c, c)
-        cache = _FlatLruTouchOnPutCache(4)
+        cache = _FlatLruCache(4)
         for node in (x, other_c, a):
             cache.write(node)
 
-        self.assertEqual(_read_flat_lru_touch_on_put_prefix(cache, plan, 3, 6), 1)
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 3, 6), 1)
         self.assertEqual(list(cache.entries), [x, other_c, a])
-        _write_flat_lru_touch_on_put_request(cache, plan, 3, 6)
+        _write_flat_lru_request(cache, plan, 3, 6)
         self.assertEqual(list(cache.entries), [other_c, a, b, c])
         # Rewriting the same exact nodes refreshes rather than duplicates them.
-        _write_flat_lru_touch_on_put_request(cache, plan, 3, 6)
+        _write_flat_lru_request(cache, plan, 3, 6)
         self.assertEqual(list(cache.entries), [other_c, a, b, c])
         cache.write(x)
         self.assertNotIn(other_c, cache)
@@ -274,10 +274,10 @@ class FlatLruTouchOnPutTests(unittest.TestCase):
     def test_existing_suffix_is_refreshed_only_when_written(self) -> None:
         plan = build_execution_plan(make_trace(["A", "B", "C"], ["X"]))
         a, b, c, x = plan.node_for_event
-        cache = _FlatLruTouchOnPutCache(3)
+        cache = _FlatLruCache(3)
         for node in (c, x, a):
             cache.write(node)
-        self.assertEqual(_read_flat_lru_touch_on_put_prefix(cache, plan, 0, 3), 1)
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 0, 3), 1)
         self.assertEqual(list(cache.entries), [c, x, a])
         # This is a write to the exact orphaned suffix node, not another raw C.
         cache.write(c)
@@ -288,23 +288,23 @@ class FlatLruTouchOnPutTests(unittest.TestCase):
     def test_writer_restores_nodes_evicted_after_the_read(self) -> None:
         plan = build_execution_plan(make_trace(["A", "B"], ["X"]))
         a, b, x = plan.node_for_event
-        cache = _FlatLruTouchOnPutCache(2)
-        _write_flat_lru_touch_on_put_request(cache, plan, 0, 2)
-        self.assertEqual(_read_flat_lru_touch_on_put_prefix(cache, plan, 0, 2), 2)
+        cache = _FlatLruCache(2)
+        _write_flat_lru_request(cache, plan, 0, 2)
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 0, 2), 2)
         cache.write(x)
         self.assertNotIn(a, cache)
         self.assertIn(b, cache)  # Evicting the parent did not discard its tail.
-        self.assertEqual(_read_flat_lru_touch_on_put_prefix(cache, plan, 0, 2), 0)
-        _write_flat_lru_touch_on_put_request(cache, plan, 0, 2)
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 0, 2), 0)
+        _write_flat_lru_request(cache, plan, 0, 2)
         self.assertEqual(list(cache.entries), [a, b])
 
     def test_tail_write_can_evict_the_head_in_one_request(self) -> None:
         plan = build_execution_plan(make_trace(["A", "B"], ["A", "B", "C"]))
         a, b, c = plan.node_for_event[2:]
-        cache = _FlatLruTouchOnPutCache(2)
-        _write_flat_lru_touch_on_put_request(cache, plan, 0, 2)
-        self.assertEqual(_read_flat_lru_touch_on_put_prefix(cache, plan, 2, 5), 2)
-        _write_flat_lru_touch_on_put_request(cache, plan, 2, 5)
+        cache = _FlatLruCache(2)
+        _write_flat_lru_request(cache, plan, 0, 2)
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 2, 5), 2)
+        _write_flat_lru_request(cache, plan, 2, 5)
         self.assertEqual(list(cache.entries), [b, c])
         self.assertNotIn(a, cache)
         result = simulate_policy(plan, "lru-flat-touch-on-put", 2)
@@ -324,8 +324,8 @@ class FlatLruTouchOnPutTests(unittest.TestCase):
         empty = replace(weighted, ids=[], tokens=[], request_starts=[0], request_count=0,
                         unique_raw_blocks=0, total_input_tokens=0, average_input_tokens=0.0)
         self.assertEqual(simulate_policy(build_execution_plan(empty), "lru-flat-touch-on-put", 1).totalTokens, 0)
-        cache = _FlatLruTouchOnPutCache(1)
-        _write_flat_lru_touch_on_put_request(cache, plan, 0, 2)
+        cache = _FlatLruCache(1)
+        _write_flat_lru_request(cache, plan, 0, 2)
         self.assertEqual(len(cache), 1)
         self.assertIn(plan.node_for_event[1], cache)
 
@@ -347,23 +347,23 @@ int main() {
   input.prefix = build_prefix_plan(input.ids, input.request_ends);
   const auto& nodes = input.prefix.node_for_event;
   const auto x = nodes[0], other_c = nodes[2], a = nodes[3], b = nodes[4], c = nodes[5];
-  FlatLruTouchOnPutCache cache(4);
+  FlatLruCache cache(4);
   cache.write(x); cache.write(other_c); cache.write(a);
-  assert(read_flat_lru_touch_on_put_prefix(cache, input, 3, 6) == 1);
-  write_flat_lru_touch_on_put_request(cache, input, 3, 6);
+  assert(read_flat_lru_prefix(cache, input, 3, 6) == 1);
+  write_flat_lru_request(cache, input, 3, 6);
   assert(cache.size() == 4 && cache.contains(other_c) && cache.contains(c));
   cache.write(x);
   assert(!cache.contains(other_c) && cache.contains(c));
 
-  FlatLruTouchOnPutCache small(2);
-  write_flat_lru_touch_on_put_request(small, input, 3, 5);
-  assert(read_flat_lru_touch_on_put_prefix(small, input, 3, 5) == 2);
+  FlatLruCache small(2);
+  write_flat_lru_request(small, input, 3, 5);
+  assert(read_flat_lru_prefix(small, input, 3, 5) == 2);
   small.write(x);
   assert(!small.contains(a) && small.contains(b));
-  assert(read_flat_lru_touch_on_put_prefix(small, input, 3, 5) == 0);
-  write_flat_lru_touch_on_put_request(small, input, 3, 5);
+  assert(read_flat_lru_prefix(small, input, 3, 5) == 0);
+  write_flat_lru_request(small, input, 3, 5);
   assert(small.contains(a) && small.contains(b));
-  write_flat_lru_touch_on_put_request(small, input, 3, 6);
+  write_flat_lru_request(small, input, 3, 6);
   assert(small.size() == 2 && !small.contains(a) && small.contains(b) && small.contains(c));
 }
 '''.replace("SOURCE_PATH", json.dumps(str(source)))
@@ -392,10 +392,11 @@ int main() {
         for trace in traces:
             for warmup_fraction in (0, 0.5, 1):
                 plan = build_execution_plan(trace, warmup_fraction)
-                native = run_cpp_sweep(trace, scheduler="sequential", capacities=[0, 1, 2, 4, 100], policies=["lru-flat-touch-on-put"], warmup_requests=plan.warmup_requests)
+                native = run_cpp_sweep(trace, scheduler="sequential", capacities=[0, 1, 2, 4, 100], policies=["lru-flat-touch-on-put", "flat-lru-memcache"], warmup_requests=plan.warmup_requests)
                 for capacity in (0, 1, 2, 4, 100):
                     with self.subTest(events=len(trace.ids), warmup=warmup_fraction, capacity=capacity):
-                        self.assertEqual(native.results[("lru-flat-touch-on-put", capacity)], simulate_policy(plan, "lru-flat-touch-on-put", capacity))
+                        for policy in ("lru-flat-touch-on-put", "flat-lru-memcache"):
+                            self.assertEqual(native.results[(policy, capacity)], simulate_policy(plan, policy, capacity))
 
     @unittest.skipUnless(shutil.which("c++"), "C++ compiler is not available")
     def test_native_single_batch_and_all_modes(self) -> None:
@@ -408,14 +409,76 @@ int main() {
                     "--total-blocks", str(len(trace.ids)), "--warmup-requests", "2", "--capacity", "2"]
             def run(*args):
                 return json.loads(subprocess.run(base + list(args), check=True, capture_output=True, text=True).stdout)
+            memcache_single = run("--policy", "flat-lru-memcache")
+            memcache_batch = run("--policy", "batch", "--capacities", "2", "--policies", "flat-lru-memcache")
             single = run("--policy", "lru-flat-touch-on-put")
             all_results = run("--policy", "all")
             batch = run("--policy", "batch", "--capacities", "2", "--policies", "lru-flat-touch-on-put")
             default_batch = run("--policy", "batch", "--capacities", "2")
+        self.assertEqual(memcache_single["hitTokens"], 2)
+        self.assertEqual(all_results["flat-lru-memcache"]["hitTokens"], 2)
+        self.assertEqual(memcache_batch["points"][0]["flat-lru-memcache"]["hitTokens"], 2)
         self.assertEqual(single["hitTokens"], 2)
         self.assertEqual(all_results["lru-flat-touch-on-put"]["hitTokens"], 2)
         self.assertEqual(set(batch["points"][0]), {"cacheBlocks", "lru-flat-touch-on-put"})
-        self.assertEqual(set(default_batch["points"][0]), {"cacheBlocks", "fifo", "lru", "lru-flat-touch-on-put", "hyper-clock", "optimal", "sampled-lru"})
+        self.assertEqual(set(default_batch["points"][0]), {"cacheBlocks", "fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal", "sampled-lru"})
+
+
+class FlatLruMemcacheTests(unittest.TestCase):
+    def test_existing_put_preserves_order_and_get_refreshes(self) -> None:
+        plan = build_execution_plan(make_trace(["A"], ["B"], ["C"], ["D"]))
+        a, b, c, d = plan.node_for_event
+        cache = _FlatLruCache(2, touch_on_put=False)
+        cache.write(a)
+        cache.write(b)
+        cache.write(a)
+        self.assertEqual(list(cache.entries), [a, b])
+        cache.write(c)
+        self.assertEqual(list(cache.entries), [b, c])
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 1, 2), 1)
+        cache.write(d)
+        self.assertEqual(list(cache.entries), [b, d])
+
+    def test_prefix_miss_does_not_refresh_orphaned_suffix_on_put(self) -> None:
+        plan = build_execution_plan(make_trace(["A", "B", "C"], ["X"]))
+        a, b, c, x = plan.node_for_event
+        cache = _FlatLruCache(4, touch_on_put=False)
+        for node in (c, x, a):
+            cache.write(node)
+        self.assertEqual(_read_flat_lru_prefix(cache, plan, 0, 3), 1)
+        _write_flat_lru_request(cache, plan, 0, 3)
+        self.assertEqual(list(cache.entries), [c, x, a, b])
+
+    def test_weighted_hits_and_boundaries(self) -> None:
+        trace = parse_trace_lines([
+            json.dumps(dict(block_size=8, hash_ids=["A", "B"], input_length=11, block_tokens=[8, 3])),
+            json.dumps(dict(block_size=8, hash_ids=["A", "C"], input_length=10, block_tokens=[8, 2])),
+        ])
+        plan = build_execution_plan(trace)
+        result = simulate_policy(plan, "flat-lru-memcache", 2)
+        self.assertEqual((result.policy, result.hitTokens, result.totalTokens), ("flat-lru-memcache", 8, 10))
+        self.assertEqual(simulate_policy(plan, "flat-lru-memcache", 0).hitTokens, 0)
+        self.assertEqual(simulate_policy(plan, "flat-lru-memcache", 3).measurementMode, "underfilled_at_window")
+        empty = replace(trace, ids=[], tokens=[], request_starts=[0], request_count=0,
+                        unique_raw_blocks=0, total_input_tokens=0, average_input_tokens=0.0)
+        self.assertEqual(simulate_policy(build_execution_plan(empty), "flat-lru-memcache", 1).totalTokens, 0)
+
+    @unittest.skipUnless(shutil.which("c++"), "C++ compiler is not available")
+    def test_overlapping_completion_does_not_refresh_existing_entry(self) -> None:
+        # A is read before B, but A's put completes after B's read and put.
+        # X must evict A under memcache and B under touch-on-put.
+        trace = parse_trace_lines([
+            json.dumps(dict(block_size=1, hash_ids=[block], input_length=1,
+                            timestamp=arrival, completion_timestamp=finish))
+            for arrival, finish, block in [
+                (0, 0, "A"), (1, 1, "B"), (2, 2, "B"), (3, 3, "B"),
+                (4, 8, "A"), (5, 6, "B"), (9, 9, "X"), (10, 10, "A"),
+            ]
+        ])
+        result = run_cpp_sweep(trace, scheduler="recorded", capacities=[2],
+                               policies=["flat-lru-memcache", "lru-flat-touch-on-put"], warmup_requests=4)
+        self.assertEqual(result.results[("flat-lru-memcache", 2)].hitTokens, 2)
+        self.assertEqual(result.results[("lru-flat-touch-on-put", 2)].hitTokens, 3)
 
 
 class SweepAndCliTests(unittest.TestCase):
@@ -489,7 +552,7 @@ class SweepAndCliTests(unittest.TestCase):
         python_result = run_sweep(
             trace,
             scheduler="sequential",
-            policies=["fifo", "lru", "lru-flat-touch-on-put", "hyper-clock", "optimal"],
+            policies=["fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal"],
             model_id="qwen3-32b",
             precision="bf16_fp16",
             budgets_gib=[0.00025],
@@ -500,7 +563,7 @@ class SweepAndCliTests(unittest.TestCase):
         cpp_result = run_sweep(
             trace,
             scheduler="sequential",
-            policies=["fifo", "lru", "lru-flat-touch-on-put", "hyper-clock", "optimal"],
+            policies=["fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal"],
             model_id="qwen3-32b",
             precision="bf16_fp16",
             budgets_gib=[0.00025],
@@ -530,7 +593,7 @@ class SweepAndCliTests(unittest.TestCase):
                 "-m",
                 "kvcache_sim",
                 "sweep",
-                "--policies", "fifo,lru,lru-flat-touch-on-put,hyper-clock,optimal",
+                "--policies", "fifo,lru,lru-flat-touch-on-put,flat-lru-memcache,hyper-clock,optimal",
                 "--scheduler", "sequential", "--trace",
                 str(trace_path),
                 "--model",
@@ -545,6 +608,7 @@ class SweepAndCliTests(unittest.TestCase):
 
             table = subprocess.run(base, cwd=Path(__file__).resolve().parents[1], check=True, text=True, capture_output=True)
             as_json = subprocess.run(base + ["--format", "json"], cwd=Path(__file__).resolve().parents[1], check=True, text=True, capture_output=True)
+            memcache_selected = subprocess.run(base + ["--policies", "flat-lru-memcache", "--format", "json"], cwd=PACKAGE_ROOT, check=True, text=True, capture_output=True)
             selected = subprocess.run(base + ["--policies", "lru-flat-touch-on-put", "--format", "json"], cwd=PACKAGE_ROOT, check=True, text=True, capture_output=True)
             if shutil.which("c++"):
                 # Omit --backend to exercise the default native backend.
@@ -553,14 +617,19 @@ class SweepAndCliTests(unittest.TestCase):
 
         self.assertIn("Budget", table.stdout)
         self.assertIn("FIFO hit", table.stdout)
+        self.assertIn("Flat LRU (memcache) hit", table.stdout)
+        self.assertIn("Flat LRU (memcache) speedup", table.stdout)
         self.assertIn("Flat LRU (touch on put) hit", table.stdout)
         self.assertIn("Flat LRU (touch on put) speedup", table.stdout)
         parsed = json.loads(as_json.stdout)
-        self.assertEqual(parsed["policies"], ["fifo", "lru", "lru-flat-touch-on-put", "hyper-clock", "optimal"])
+        self.assertEqual(parsed["policies"], ["fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal"])
         self.assertIn("HYPER-CLOCK hit", table.stdout)
         self.assertIn("HYPER-CLOCK speedup", table.stdout)
         self.assertIn("Hyper Clock max score: 3", table.stdout)
         self.assertIn("idealPrefillSpeedup", parsed["points"][0]["results"]["lru-flat-touch-on-put"])
+        memcache_result = json.loads(memcache_selected.stdout)
+        self.assertEqual(memcache_result["policies"], ["flat-lru-memcache"])
+        self.assertEqual(set(memcache_result["points"][0]["results"]), {"flat-lru-memcache"})
         selected_result = json.loads(selected.stdout)
         self.assertEqual(selected_result["policies"], ["lru-flat-touch-on-put"])
         self.assertEqual(set(selected_result["points"][0]["results"]), {"lru-flat-touch-on-put"})

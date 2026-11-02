@@ -152,7 +152,7 @@ Options parse_args(int argc, char** argv) {
     else throw std::runtime_error("Unknown argument: " + arg);
   }
   if (options.policy.empty() || options.ids_path.empty() || options.tokens_path.empty() || options.total_blocks == 0) {
-    throw std::runtime_error("Usage: kv-cache-lab-native-sim --scheduler recorded|sequential --policy fifo|lru|lru-flat-touch-on-put|hyper-clock|optimal|sampled-lru|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--hyper-clock-max-score N] [--next PATH]");
+    throw std::runtime_error("Usage: kv-cache-lab-native-sim --scheduler recorded|sequential --policy fifo|lru|lru-flat-touch-on-put|flat-lru-memcache|hyper-clock|optimal|sampled-lru|all|batch|ceiling --ids PATH --tokens PATH --total-blocks N --request-ends PATH --request-count N --capacity N [--hyper-clock-max-score N] [--next PATH]");
   }
   if (options.policy != "build-next" && (options.request_ends_path.empty() || options.request_count == 0)) {
     throw std::runtime_error("--request-ends and --request-count are required");
@@ -613,9 +613,10 @@ Result simulate_fifo(const SimulationInput& input, std::uint32_t capacity, const
 }
 
 // Node IDs retain prefix identity; eviction ignores parent/child relationships.
-class FlatLruTouchOnPutCache {
+class FlatLruCache {
  public:
-  explicit FlatLruTouchOnPutCache(std::uint32_t capacity) : capacity_(capacity) {}
+  explicit FlatLruCache(std::uint32_t capacity, bool touch_on_put = true)
+      : capacity_(capacity), touch_on_put_(touch_on_put) {}
 
   bool contains(std::uint32_t node) const { return entries_.find(node) != entries_.end(); }
   std::size_t size() const { return entries_.size(); }
@@ -627,7 +628,7 @@ class FlatLruTouchOnPutCache {
   void write(std::uint32_t node) {
     if (capacity_ == 0) return;
     if (contains(node)) {
-      touch(node);
+      if (touch_on_put_) touch(node);
       return;
     }
     if (size() >= capacity_) {
@@ -640,12 +641,13 @@ class FlatLruTouchOnPutCache {
 
  private:
   std::uint32_t capacity_;
+  bool touch_on_put_;
   std::list<std::uint32_t> order_;  // Most recently used first.
   std::unordered_map<std::uint32_t, std::list<std::uint32_t>::iterator> entries_;
 };
 
-std::uint64_t read_flat_lru_touch_on_put_prefix(
-    FlatLruTouchOnPutCache& cache, const SimulationInput& input, std::uint64_t start, std::uint64_t end) {
+std::uint64_t read_flat_lru_prefix(
+    FlatLruCache& cache, const SimulationInput& input, std::uint64_t start, std::uint64_t end) {
   std::uint64_t hit_tokens = 0;
   for (std::uint64_t index = start; index < end; index += 1) {
     const std::uint32_t node = input.prefix.node_for_event[index];
@@ -656,8 +658,8 @@ std::uint64_t read_flat_lru_touch_on_put_prefix(
   return hit_tokens;
 }
 
-void write_flat_lru_touch_on_put_request(
-    FlatLruTouchOnPutCache& cache, const SimulationInput& input, std::uint64_t start, std::uint64_t end) {
+void write_flat_lru_request(
+    FlatLruCache& cache, const SimulationInput& input, std::uint64_t start, std::uint64_t end) {
   // Check live membership for the whole request, independently of the read.
   // Do not restart if a later insertion evicts an earlier node.
   for (std::uint64_t index = start; index < end; index += 1) {
@@ -665,10 +667,10 @@ void write_flat_lru_touch_on_put_request(
   }
 }
 
-Result simulate_flat_lru_touch_on_put(const SimulationInput& input, std::uint32_t capacity, const Options& options) {
+Result simulate_flat_lru(const SimulationInput& input, std::uint32_t capacity, const Options& options, bool touch_on_put = true) {
   if (capacity == 0 || input.ids.empty()) return no_cache_result(input, options);
   Result result;
-  FlatLruTouchOnPutCache cache(capacity);
+  FlatLruCache cache(capacity, touch_on_put);
   bool full_before_measurement = false;
   auto& scheduler = RequestScheduler::get();
   while (const auto event = scheduler.next_event()) {
@@ -681,13 +683,13 @@ Result simulate_flat_lru_touch_on_put(const SimulationInput& input, std::uint32_
         scheduler.reset();
         return underfilled_result(input, options);
       }
-      const std::uint64_t request_hits = read_flat_lru_touch_on_put_prefix(cache, input, start, end);
+      const std::uint64_t request_hits = read_flat_lru_prefix(cache, input, start, end);
       if (request >= options.warmup_requests) {
         result.hit_tokens += request_hits;
         for (std::uint64_t index = start; index < end; index += 1) result.total_tokens += input.tokens[index];
       }
     } else {
-      write_flat_lru_touch_on_put_request(cache, input, start, end);
+      write_flat_lru_request(cache, input, start, end);
       if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
     }
   }
@@ -1140,6 +1142,7 @@ struct AllResults {
   Result fifo;
   Result lru;
   Result flat_lru_touch_on_put;
+  Result flat_lru_memcache;
   Result hyper_clock;
   Result optimal;
   Result sampled;
@@ -1152,7 +1155,7 @@ bool has_policy(const Options& options, const std::string& policy) {
 
 std::uint64_t selected_policy_count(const Options& options) {
   std::uint64_t count = 0;
-  for (const auto* policy : {"sampled-lru", "fifo", "lru", "lru-flat-touch-on-put", "hyper-clock", "optimal"}) {
+  for (const auto* policy : {"sampled-lru", "fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal"}) {
     if (has_policy(options, policy)) ++count;
   }
   return count;
@@ -1197,6 +1200,8 @@ void print_all_results(std::uint64_t cache_blocks, const AllResults& results, st
   print_named_result("lru", cache_blocks, results.lru, warmup_requests);
   std::cout << "},\"lru-flat-touch-on-put\":{";
   print_named_result("lru-flat-touch-on-put", cache_blocks, results.flat_lru_touch_on_put, warmup_requests);
+  std::cout << "},\"flat-lru-memcache\":{";
+  print_named_result("flat-lru-memcache", cache_blocks, results.flat_lru_memcache, warmup_requests);
   std::cout << "},\"hyper-clock\":{";
   print_named_result("hyper-clock", cache_blocks, results.hyper_clock, warmup_requests);
   std::cout << "},\"optimal\":{";
@@ -1229,7 +1234,8 @@ class SimulationRunner {
     if (policy == "ceiling") return simulate_ceiling(input, options);
     if (policy == "fifo") return simulate_fifo(input, capacity, options);
     if (policy == "lru") return simulate_trie_policy(input, capacity, false, options);
-    if (policy == "lru-flat-touch-on-put") return simulate_flat_lru_touch_on_put(input, capacity, options);
+    if (policy == "lru-flat-touch-on-put") return simulate_flat_lru(input, capacity, options);
+    if (policy == "flat-lru-memcache") return simulate_flat_lru(input, capacity, options, false);
     if (policy == "hyper-clock") return simulate_hyper_clock(input, capacity, options);
     if (policy == "optimal") return simulate_trie_policy(input, capacity, true, options);
     throw std::runtime_error("Unsupported policy: " + policy);
@@ -1237,7 +1243,7 @@ class SimulationRunner {
 
   AllResults simulate_all(std::uint32_t capacity) {
     return {
-      run("fifo", capacity), run("lru", capacity), run("lru-flat-touch-on-put", capacity),
+      run("fifo", capacity), run("lru", capacity), run("lru-flat-touch-on-put", capacity), run("flat-lru-memcache", capacity),
       run("hyper-clock", capacity), run("optimal", capacity),
       run("sampled-lru", capacity),
     };
@@ -1280,6 +1286,7 @@ class SimulationRunner {
       Result fifo;
       Result lru;
       Result flat_lru_touch_on_put;
+      Result flat_lru_memcache;
       Result hyper_clock;
       Result optimal;
       Result sampled;
@@ -1288,6 +1295,7 @@ class SimulationRunner {
       if (has_policy(options, "fifo")) fifo = evaluate("fifo");
       if (has_policy(options, "lru")) lru = evaluate("lru");
       if (has_policy(options, "lru-flat-touch-on-put")) flat_lru_touch_on_put = evaluate("lru-flat-touch-on-put");
+      if (has_policy(options, "flat-lru-memcache")) flat_lru_memcache = evaluate("flat-lru-memcache");
       if (has_policy(options, "hyper-clock")) hyper_clock = evaluate("hyper-clock");
       if (has_policy(options, "optimal")) optimal = evaluate("optimal");
 
@@ -1308,6 +1316,11 @@ class SimulationRunner {
       if (has_policy(options, "lru-flat-touch-on-put")) {
         std::cout << ",\"lru-flat-touch-on-put\":{";
         print_named_result("lru-flat-touch-on-put", capacity, flat_lru_touch_on_put, options.warmup_requests);
+        std::cout << "}";
+      }
+      if (has_policy(options, "flat-lru-memcache")) {
+        std::cout << ",\"flat-lru-memcache\":{";
+        print_named_result("flat-lru-memcache", capacity, flat_lru_memcache, options.warmup_requests);
         std::cout << "}";
       }
       if (has_policy(options, "hyper-clock")) {

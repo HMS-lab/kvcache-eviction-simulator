@@ -1,6 +1,6 @@
 # Sampled LRU and recorded-time replay
 
-The C++ backend runs `sampled-lru` with the five existing policies by default.
+The C++ backend runs `sampled-lru` with the six other policies by default.
 Every policy uses the scheduler selected with the required `--scheduler` option.
 The ceiling uses the same scheduler.
 

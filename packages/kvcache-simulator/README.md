@@ -10,7 +10,7 @@ pip install kvcache-simulator
 
 The default backend compiles the bundled C++ simulator on first use.
 You need a local C++ compiler such as `c++` or `clang++`.
-The Python backend supports sequential replay for the five existing policies.
+The Python backend supports sequential replay for the six policies other than Sampled LRU.
 It does not support recorded-time replay or sequential Sampled LRU.
 
 ## Quick Start
@@ -114,7 +114,7 @@ Use the same scheduler when you compare policy results.
 | Cache writes | Immediately after that request's read. | At the recorded completion time. |
 | Timing fields | Not required. The scheduler ignores them. | Required for every request. |
 | Virtual clock | Always zero. | Jumps between event times without real-time waits. |
-| Backend | C++ supports all six policies. Python supports the five existing policies. | C++ supports all six policies. |
+| Backend | C++ supports all seven policies. Python supports the six policies other than Sampled LRU. | C++ supports all seven policies. |
 
 Use sequential replay to compare eviction behavior with immediate cache writes.
 It preserves the original replay order for FIFO, LRU, Flat LRU (touch on put), HYPER-CLOCK, and OPTIMAL.
@@ -183,11 +183,11 @@ Python API calls to `run_sweep()` and `run_cpp_sweep()` also require `scheduler=
 | `--block-size N` | Fallback block size when trace records omit `block_size`; trace-declared `block_size` overrides it. |
 | `--estimate-tokens N` | Override the token count used for token-dependent bytes/token formulas. By default the trace average input length is used. |
 | `--budgets-gib A,B,C` | Comma-separated KV cache memory budgets in GiB. Default matches the web budget sweep: `1,2,4,...,16384`. |
-| `--policies fifo,lru,lru-flat-touch-on-put,hyper-clock,optimal,sampled-lru` | C++ defaults to all six policies. Python defaults to the five existing policies. |
+| `--policies fifo,lru,lru-flat-touch-on-put,flat-lru-memcache,hyper-clock,optimal,sampled-lru` | C++ defaults to all seven policies. Python defaults to the six policies other than Sampled LRU. |
 | `--scheduler recorded\|sequential` | Required. Selects one scheduler for every policy and the ceiling. |
 | `--hyper-clock-max-score N` | Hyper Clock score limit; default `3`. Must be an integer in `1..2^64-1`. |
 | `--sampled-lru-max-evictions k` | Evict at most `k` oldest qualifying sampled blocks; default evicts all qualifying sampled blocks. |
-| `--backend cpp\|python` | Default is `cpp`. Python supports sequential replay for the five existing policies. |
+| `--backend cpp\|python` | Default is `cpp`. Python supports sequential replay for the six policies other than Sampled LRU. |
 | `--jobs N` | Number of worker processes for the Python backend. The C++ backend runs one batch process and ignores this option. |
 | `--no-progress` | Disable terminal progress output. Progress is written to stderr only when stderr is interactive, so JSON stdout stays valid. |
 | `--format table\|json` | Output format. Default is `table`. |
@@ -202,6 +202,12 @@ All policies use prefix-specific block identities: the same raw block ID under d
 Flat LRU (touch on put) processes each request with separate read and write passes. Reading refreshes only the continuous cached prefix, stopping at the first miss. Writing visits the complete request in prefix order: an exact cached node is refreshed, and a missing node is inserted, evicting the least recent entry when full. A matching raw block ID under another prefix is a different entry. The writer checks current membership even for blocks read earlier. Tail insertion may evict the head of the same request; the writer makes one pass without restarting repairs. Recency follows access order, not timestamps.
 
 Flat LRU (touch on put) appears as `Flat LRU (touch on put) hit` and `Flat LRU (touch on put) speedup` in the default table and as `lru-flat-touch-on-put` in JSON results. To run only this policy, add `--policies lru-flat-touch-on-put` with either backend.
+
+### Flat LRU (memcache)
+
+`flat-lru-memcache` uses the same prefix identities, flat eviction, and separate read and write passes as `lru-flat-touch-on-put`. Inserting a new entry makes it most recently used. A successful read also makes the entry most recently used. Putting an entry that is already cached leaves its recency unchanged, including when a request completes after other requests have read the cache. Reads still stop at the first prefix miss. The write pass leaves existing cached descendants beyond that miss in place without refreshing them; any missing entries are inserted as most recently used.
+
+Run it with `--policies flat-lru-memcache`. Both backends support sequential replay; the C++ backend also supports recorded-time replay. It is included in the default policy set and appears as `Flat LRU (memcache)` in tables and `flat-lru-memcache` in JSON.
 
 ### Hyper Clock
 

@@ -126,11 +126,12 @@ def simulate_fifo(plan: ExecutionPlan, capacity: int) -> PolicyResult:
     return _finish("fifo", capacity, plan, hit_tokens, total_tokens)
 
 
-class _FlatLruTouchOnPutCache:
+class _FlatLruCache:
     """An access-ordered cache keyed by prefix-trie node ID, not raw block ID."""
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, *, touch_on_put: bool = True) -> None:
         self.capacity = capacity
+        self.touch_on_put = touch_on_put
         self.entries: OrderedDict[int, None] = OrderedDict()
 
     def __contains__(self, node: int) -> bool:
@@ -146,14 +147,15 @@ class _FlatLruTouchOnPutCache:
         if self.capacity <= 0:
             return
         if node in self:
-            self.touch(node)
+            if self.touch_on_put:
+                self.touch(node)
             return
         if len(self) >= self.capacity:
             self.entries.popitem(last=False)
         self.entries[node] = None
 
 
-def _read_flat_lru_touch_on_put_prefix(cache: _FlatLruTouchOnPutCache, plan: ExecutionPlan, start: int, end: int) -> int:
+def _read_flat_lru_prefix(cache: _FlatLruCache, plan: ExecutionPlan, start: int, end: int) -> int:
     hit_tokens = 0
     for index in range(start, end):
         node = plan.node_for_event[index]
@@ -164,35 +166,36 @@ def _read_flat_lru_touch_on_put_prefix(cache: _FlatLruTouchOnPutCache, plan: Exe
     return hit_tokens
 
 
-def _write_flat_lru_touch_on_put_request(cache: _FlatLruTouchOnPutCache, plan: ExecutionPlan, start: int, end: int) -> None:
+def _write_flat_lru_request(cache: _FlatLruCache, plan: ExecutionPlan, start: int, end: int) -> None:
     # Check every node against live state, independently of the preceding read.
     # A later insertion may evict an earlier node; do not restart the write.
     for index in range(start, end):
         cache.write(plan.node_for_event[index])
 
 
-def simulate_flat_lru_touch_on_put(plan: ExecutionPlan, capacity: int) -> PolicyResult:
+def simulate_flat_lru(plan: ExecutionPlan, capacity: int, *, touch_on_put: bool = True) -> PolicyResult:
+    policy = "lru-flat-touch-on-put" if touch_on_put else "flat-lru-memcache"
     if capacity <= 0 or not plan.ids:
-        return _no_cache("lru-flat-touch-on-put", capacity, plan)
-    cache = _FlatLruTouchOnPutCache(capacity)
+        return _no_cache(policy, capacity, plan)
+    cache = _FlatLruCache(capacity, touch_on_put=touch_on_put)
     full_before_measurement = False
     hit_tokens = 0
 
     for request_index in range(plan.request_count):
         if request_index >= plan.warmup_requests and not full_before_measurement:
-            return _underfilled("lru-flat-touch-on-put", capacity, plan)
+            return _underfilled(policy, capacity, plan)
         start = plan.request_starts[request_index]
         end = plan.request_starts[request_index + 1]
-        request_hits = _read_flat_lru_touch_on_put_prefix(cache, plan, start, end)
+        request_hits = _read_flat_lru_prefix(cache, plan, start, end)
         if request_index >= plan.warmup_requests:
             hit_tokens += request_hits
-        _write_flat_lru_touch_on_put_request(cache, plan, start, end)
+        _write_flat_lru_request(cache, plan, start, end)
         if request_index < plan.warmup_requests and len(cache) >= capacity:
             full_before_measurement = True
 
     if not full_before_measurement or plan.total_measured_tokens <= 0:
-        return _underfilled("lru-flat-touch-on-put", capacity, plan)
-    return _finish("lru-flat-touch-on-put", capacity, plan, hit_tokens, plan.total_measured_tokens)
+        return _underfilled(policy, capacity, plan)
+    return _finish(policy, capacity, plan, hit_tokens, plan.total_measured_tokens)
 
 
 @dataclass
@@ -479,7 +482,9 @@ def simulate_policy(
     if policy == "lru":
         return simulate_trie_policy(plan, capacity, optimal=False)
     if policy == "lru-flat-touch-on-put":
-        return simulate_flat_lru_touch_on_put(plan, capacity)
+        return simulate_flat_lru(plan, capacity)
+    if policy == "flat-lru-memcache":
+        return simulate_flat_lru(plan, capacity, touch_on_put=False)
     if policy == "hyper-clock":
         return simulate_hyper_clock(plan, capacity, max_score=hyper_clock_max_score)
     if policy == "optimal":
