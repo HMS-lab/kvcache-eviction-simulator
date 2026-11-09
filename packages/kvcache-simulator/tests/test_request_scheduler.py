@@ -321,8 +321,8 @@ class NativeRequestSchedulerTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=20).stdout.splitlines()
         counts = []
         for line in output[:-1]:
-            tag, done, total, worker, job, label = line.split(' ', 5)
-            self.assertEqual(tag, 'KV_WORKER_PROGRESS')
+            tag, done, total, running, worker, job, finished, label = line.split(' ', 7)
+            self.assertEqual(tag, 'KV_JOB_PROGRESS')
             self.assertEqual(int(total), 1000)
             self.assertIn(int(worker), range(4))
             self.assertEqual(label, f'job {job}')

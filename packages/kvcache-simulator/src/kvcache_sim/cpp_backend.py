@@ -23,6 +23,7 @@ UINT32_MAX = 2**32 - 1
 UINT16_MAX = 2**16 - 1
 ProgressCallback = Callable[[int, int, str], None]
 WorkerProgressCallback = Callable[[int, int, str], None]
+JobProgressCallback = Callable[[int, int, int], None]
 
 
 @dataclass(frozen=True)
@@ -122,20 +123,26 @@ def _to_policy_result(policy: str, capacity: int, warmup_requests: int, payload:
 def _read_progress(
     process: subprocess.Popen[str], progress: ProgressCallback | None, total_prefix: int,
     worker_progress: WorkerProgressCallback | None = None,
+    job_progress: JobProgressCallback | None = None,
 ) -> list[str]:
     stderr_lines: list[str] = []
     if process.stderr is None:
         return stderr_lines
     for raw in process.stderr:
         line = raw.rstrip("\n")
+        job_message = line.startswith("KV_JOB_PROGRESS ")
         worker_message = line.startswith("KV_WORKER_PROGRESS ")
-        if worker_message or line.startswith("KV_PROGRESS "):
-            parts = line.split(" ", 5 if worker_message else 3)
+        if job_message or worker_message or line.startswith("KV_PROGRESS "):
+            parts = line.split(" ", 7 if job_message else 5 if worker_message else 3)
             try:
-                if len(parts) != (6 if worker_message else 4):
+                if len(parts) != (8 if job_message else 6 if worker_message else 4):
                     raise ValueError("Incomplete progress message")
                 done, total = int(parts[1]), int(parts[2])
-                if worker_message:
+                if job_message:
+                    running, worker, job, finished = map(int, parts[3:7])
+                    if running < 0 or worker < -1 or job < 0 or finished not in (0, 1):
+                        raise ValueError("Invalid job progress")
+                elif worker_message:
                     worker, job = int(parts[3]), int(parts[4])
                     if worker < 0 or job < 0:
                         raise ValueError("Invalid progress identity")
@@ -143,10 +150,12 @@ def _read_progress(
             except ValueError:
                 stderr_lines.append(line)
                 continue
+            if job_message and job_progress:
+                job_progress(done, total, running)
             if progress:
                 progress(total_prefix + done, total_prefix + total, label)
-            if worker_message and worker_progress:
-                worker_progress(worker, job, label)
+            if (worker_message or job_message and worker >= 0) and worker_progress:
+                worker_progress(worker, job, "idle" if job_message and finished else label)
             continue
         stderr_lines.append(line)
     return stderr_lines
@@ -168,6 +177,7 @@ def run_cpp_sweep(
     release_trace_data: bool = False,
     progress: ProgressCallback | None = None,
     worker_progress: WorkerProgressCallback | None = None,
+    job_progress: JobProgressCallback | None = None,
 ) -> CppSweepResult:
     """Run native replay; optionally consume the trace's event lists after writing."""
     if isinstance(jobs, bool) or not isinstance(jobs, int) or not 1 <= jobs <= UINT32_MAX:
@@ -239,7 +249,7 @@ def run_cpp_sweep(
         if any(p in SAMPLING_POLICIES for p in policies) and sampled_lru_max_evictions is not None:
             command.extend(("--sampled-lru-max-evictions", str(sampled_lru_max_evictions)))
         command.extend(("--jobs", str(jobs)))
-        if progress or worker_progress:
+        if progress or worker_progress or job_progress:
             command.append("--progress")
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stderr_lines: list[str] = []
@@ -247,7 +257,8 @@ def run_cpp_sweep(
         stdout_parts: list[str] = []
         stderr_thread = threading.Thread(target=lambda: stderr_lines.extend(_read_progress(
             process, lambda *args: updates.put(("overall", args)), 1,
-            lambda *args: updates.put(("worker", args)))), daemon=True)
+            lambda *args: updates.put(("worker", args)),
+            lambda *args: updates.put(("jobs", args)))), daemon=True)
         # Drain both pipes while the calling thread handles terminal updates.
         stdout_thread = threading.Thread(
             target=lambda: stdout_parts.append(process.stdout.read() if process.stdout else ""), daemon=True)
@@ -259,7 +270,7 @@ def run_cpp_sweep(
                     kind, args = updates.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                callback = progress if kind == "overall" else worker_progress
+                callback = {"overall": progress, "worker": worker_progress, "jobs": job_progress}[kind]
                 if callback:
                     callback(*args)
         except BaseException:

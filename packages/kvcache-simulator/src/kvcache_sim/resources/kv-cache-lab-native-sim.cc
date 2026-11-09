@@ -29,7 +29,7 @@ namespace {
 constexpr std::size_t kChunkEvents = 1'000'000;
 
 struct ProgressState {
-  std::atomic<std::uint64_t> completed{0};
+  std::atomic<std::uint64_t> completed{0}, running{0};
 };
 
 struct Options {
@@ -54,6 +54,7 @@ struct Options {
   ProgressState* progress_state = nullptr;
   std::int64_t progress_worker = -1;
   std::uint64_t progress_job = 0;
+  bool progress_finished = false;
   std::string arrivals_path, completions_path, order_path;
   std::uint64_t sampled_threshold = 10000000, sampled_seed = 0;
   std::vector<std::uint32_t> sampled_sizes{16};
@@ -210,7 +211,12 @@ void report_progress(const Options& options, std::uint64_t done, std::uint64_t t
   if (!lock.owns_lock()) return;
   // Read after locking so concurrent messages cannot publish an older count.
   if (options.progress_state) done = options.progress_state->completed.load(std::memory_order_relaxed);
-  if (options.progress_worker >= 0) {
+  if (options.progress_state) {
+    std::cerr << "KV_JOB_PROGRESS " << done << " " << total << " "
+              << options.progress_state->running.load(std::memory_order_relaxed) << " "
+              << options.progress_worker << " " << options.progress_job << " "
+              << options.progress_finished << " " << label << "\n";
+  } else if (options.progress_worker >= 0) {
     std::cerr << "KV_WORKER_PROGRESS " << done << " " << total << " "
               << options.progress_worker << " " << options.progress_job << " " << label << "\n";
   } else {
@@ -1470,6 +1476,7 @@ class SimulationRunner {
 
     auto execute = [&](const SimulationJob* job, std::size_t worker) {
       try {
+        progress_state.running.fetch_add(1, std::memory_order_relaxed);
         Options configured = options;
         configured.sampled_size = job->sample_size;
         configured.progress_done = progress_state.completed.load(std::memory_order_relaxed);
@@ -1483,9 +1490,10 @@ class SimulationRunner {
         results[job->result_index] = sampling
             ? simulate_sampled(input, job->capacity, configured, job->policy == "sampling-lru-touch-on-put")
             : run(job->policy, job->capacity);
+        progress_state.running.fetch_sub(1, std::memory_order_relaxed);
         progress_state.completed.fetch_add(1, std::memory_order_relaxed);
-        if (job->capacity_index != 0)
-          report_progress(configured, 0, total_steps, job->label);
+        configured.progress_finished = true;
+        report_progress(configured, 0, total_steps, job->label);
       } catch (const std::exception& error) {
         fail_worker(worker, job, error.what());
       } catch (...) {
@@ -1534,7 +1542,10 @@ class SimulationRunner {
       }
       std::cout << "}";
     }
-    report_progress(options, total_steps, total_steps, "simulation complete");
+    Options final_progress = options;
+    final_progress.progress_state = &progress_state;
+    final_progress.progress_finished = true;
+    report_progress(final_progress, total_steps, total_steps, "simulation complete");
     std::cout << "]}\n";
   }
 

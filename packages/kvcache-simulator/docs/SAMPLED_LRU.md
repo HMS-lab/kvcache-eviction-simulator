@@ -105,14 +105,17 @@ The simulator checks wall time every 4096 operations to limit logging overhead.
 The simulator also attempts to report the start and end of each run.
 Short runs can finish before the first periodic update.
 
-The event percentage belongs to the current run. The bar percentage tracks completed runs across the whole simulation.
+The event percentage belongs to the current run.
+The header shows total, finished, and running jobs across the whole simulation.
 An underfilled cache reports its percentage at the stopping point. It does not count skipped events as processed.
 A zero-capacity run reports that it skips cache simulation.
 
-The CLI displays an overall bar and one fixed row per worker on interactive stderr.
+The CLI displays a job-count header and one fixed row per worker on interactive stderr.
 The CLI starts up to `--jobs` C++ worker threads. The default is `16`.
 Use `--jobs 1` for sequential execution.
 Each message identifies the worker and job. A new job replaces the previous job in that worker's row.
+Worker rows show the policy, sample size where applicable, cache capacity in blocks, and event progress when available.
+Worker rows omit job IDs and position counters. Policies without event progress show only their policy and capacity.
 Python reads both subprocess pipes in background threads. The calling thread invokes progress callbacks and renders the rows.
 The display refreshes at most five times per second, except for new rows and final updates.
 

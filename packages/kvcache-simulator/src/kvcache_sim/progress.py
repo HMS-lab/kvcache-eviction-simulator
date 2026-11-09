@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import re
 import sys
 import time
 
@@ -16,6 +17,7 @@ class ProgressBar:
         self._row_count = 0
         self._workers: dict[int, tuple[int, str]] = {}
         self._overall = ""
+        self._job_counts: tuple[int, int, int] | None = None
         self._last_draw = 0.0
 
     def update(self, done: float, total: float, label: str) -> None:
@@ -26,14 +28,32 @@ class ProgressBar:
         filled = round(self.width * done_value / total_value)
         bar = "#" * filled + "-" * (self.width - filled)
         percent = round(100 * done_value / total_value)
-        self._overall = f"[{bar}] {percent:3d}% {label}"
+        if self._job_counts is None:
+            self._overall = f"[{bar}] {percent:3d}% {label}"
         self._draw(force=done_value == total_value)
+
+    def update_jobs(self, done: int, total: int, running: int) -> None:
+        if not self.enabled:
+            return
+        first = self._job_counts is None
+        self._job_counts = (done, total, running)
+        self._overall = f"Jobs: {total} total | {done} finished | {running} running"
+        self._draw(force=first or done == total)
+
+    @staticmethod
+    def _worker_label(label: str) -> str:
+        match = re.match(r"^(.*?) \(cache capacity \d+/\d+, (\d+) blocks; policy \d+/\d+\)(.*)$", label)
+        if match:
+            policy, capacity, progress = match.groups()
+            policy = policy.replace(":sample-size=", " sample=")
+            return f"{policy} | {capacity} blocks{progress}"
+        return label
 
     def update_worker(self, worker: int, job: int, label: str) -> None:
         if not self.enabled:
             return
         new_worker = worker not in self._workers
-        self._workers[worker] = (job, label)
+        self._workers[worker] = (job, self._worker_label(label))
         self._draw(force=new_worker)
 
     def _draw(self, *, force: bool = False) -> None:
@@ -49,7 +69,7 @@ class ProgressBar:
             for worker in range(max(self._workers, default=-1) + 1):
                 if worker in self._workers:
                     job, label = self._workers[worker]
-                    lines.append(f"Worker {worker} | job {job}: {label}")
+                    lines.append(f"Worker {worker}: {label}")
                 else:
                     lines.append(f"Worker {worker}: waiting")
             # Keep each row on one terminal line, preserving the progress suffix.
@@ -76,6 +96,7 @@ class ProgressBar:
         if not self.enabled:
             return
         self._workers.clear()
+        self._job_counts = None
         self.update(1, 1, label)
         self.close()
 

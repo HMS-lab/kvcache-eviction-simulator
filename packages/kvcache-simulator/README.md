@@ -334,8 +334,9 @@ For an end-to-end example, use capacity `3`, maximum score `3`, and these four o
 
 ## Performance Notes
 
-The CLI displays an overall progress bar and one row per worker on interactive stderr.
-Each row identifies the current job. C++ workers share one trace and schedule. Each simulation has a separate cache and cursor.
+The CLI displays job counts and one row per worker on interactive stderr.
+The header shows total, finished, and running jobs. Worker rows show the policy, cache capacity, and event progress when available.
+C++ workers share one trace and schedule. Each simulation has a separate cache and cursor.
 Progress updates are best effort. Use `--no-progress` to disable the display.
 
 The C++ backend loads the trace and builds the prefix trie once.
