@@ -178,6 +178,10 @@ Options parse_args(int argc, char** argv) {
   if (options.policy != "build-next" && options.scheduler != "sequential" && options.scheduler != "recorded") {
     throw std::runtime_error("Select --scheduler sequential or --scheduler recorded");
   }
+  if (options.sampled_sizes.size() > 1 &&
+      (options.policy == "all" || options.policy.find("sampling-lru-") == 0)) {
+    throw std::runtime_error("Multiple sample sizes require --policy batch with --capacities");
+  }
   return options;
 }
 
@@ -1357,23 +1361,6 @@ class SimulationRunner {
     return {"fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal", "sampling-lru-touch-on-put", "sampling-lru-touch-on-get"};
   }
 
-  void print_grouped_results() {
-    std::cout << "{\"cacheBlocks\":" << options.capacity << ",\"trieNodeCount\":" << input.prefix.parent.size();
-    for (const auto& policy : selected_names()) {
-      const bool sampling = policy.find("sampling-lru-") == 0;
-      for (auto size : sampling ? options.sampled_sizes : std::vector<std::uint32_t>{0}) {
-        Options configured = options;
-        configured.sampled_size = size;
-        const auto id = sampling ? policy + ":sample-size=" + std::to_string(size) : policy;
-        auto result = sampling ? simulate_sampled(input, options.capacity, configured, policy == "sampling-lru-touch-on-put") : run(policy, options.capacity);
-        std::cout << ",\"" << id << "\":{";
-        print_named_result(policy.c_str(), options.capacity, result, options.warmup_requests);
-        std::cout << "}";
-      }
-    }
-    std::cout << "}\n";
-  }
-
   void print_batch_results() {
     const std::uint64_t trie_node_count = input.prefix.parent.size();
     const std::uint64_t policy_count = selected_policy_count(options);
@@ -1440,7 +1427,6 @@ class SimulationRunner {
 int main(int argc, char** argv) {
   try {
     Options options = parse_args(argc, argv);
-    const bool grouped = options.sampled_sizes.size() > 1 && (options.policy == "all" || options.policy.find("sampling-lru-") == 0);
     if (options.policy == "build-next") {
       build_next_file(options);
       std::cout << "{\"policy\":\"build-next\",\"cacheBlocks\":0,\"hitTokens\":0,\"totalTokens\":0,\"hitRate\":0}\n";
@@ -1451,8 +1437,7 @@ int main(int argc, char** argv) {
     const SimulationInput input = load_simulation_input(options);
     SimulationRunner runner(input, options);
     const std::uint64_t trie_node_count = input.prefix.parent.size();
-    if (grouped) runner.print_grouped_results();
-    else if (options.policy == "batch") runner.print_batch_results();
+    if (options.policy == "batch") runner.print_batch_results();
     else if (options.policy == "all") print_all_results(options.capacity, runner.simulate_all(options.capacity), trie_node_count, options.warmup_requests);
     else print_result(options.policy, options.capacity, runner.run(options.policy, options.capacity), trie_node_count, options.warmup_requests);
     return 0;
