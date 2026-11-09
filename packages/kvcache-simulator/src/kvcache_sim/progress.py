@@ -7,7 +7,7 @@ import time
 
 
 class ProgressBar:
-    """Render progress on the calling thread, with one fixed row per worker."""
+    """Render progress on the calling thread, with one row per active worker."""
 
     def __init__(self, *, enabled: bool, width: int = 28) -> None:
         self.enabled = enabled
@@ -37,6 +37,8 @@ class ProgressBar:
             return
         first = self._job_counts is None
         self._job_counts = (done, total, running)
+        if done == total and running == 0:
+            self._workers.clear()
         self._overall = f"Jobs: {total} total | {done} finished | {running} running"
         self._draw(force=first or done == total)
 
@@ -52,6 +54,11 @@ class ProgressBar:
     def update_worker(self, worker: int, job: int, label: str) -> None:
         if not self.enabled:
             return
+        if label == "idle":
+            removed = self._workers.pop(worker, None)
+            if removed is not None:
+                self._draw(force=True)
+            return
         new_worker = worker not in self._workers
         self._workers[worker] = (job, self._worker_label(label))
         self._draw(force=new_worker)
@@ -66,12 +73,8 @@ class ProgressBar:
             self._row_count = 1
         else:
             lines = [self._overall]
-            for worker in range(max(self._workers, default=-1) + 1):
-                if worker in self._workers:
-                    job, label = self._workers[worker]
-                    lines.append(f"Worker {worker}: {label}")
-                else:
-                    lines.append(f"Worker {worker}: waiting")
+            for worker, (_job, label) in sorted(self._workers.items()):
+                lines.append(f"Worker {worker}: {label}")
             # Keep each row on one terminal line, preserving the progress suffix.
             columns = max(4, shutil.get_terminal_size().columns - 1)
             def fit(line: str) -> str:
