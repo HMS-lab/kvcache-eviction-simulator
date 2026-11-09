@@ -200,25 +200,34 @@ HyperClock stores a separate write offset for each request in flight.
 It restores read hits that the cache evicts before completion.
 OPTIMAL excludes past arrivals when it selects future-use priorities at completion.
 
-The interface provides these methods:
+The shared scheduler provides these methods:
 
-- `RequestScheduler::get()` returns the shared instance.
-  It asserts that the instance exists and its cursor is zero.
-  Policies call this method instead of receiving a scheduler argument.
-
-- `next_event()` returns the next event and advances the cursor.
+- `RequestScheduler::get()` returns a read-only reference to the shared instance.
+  It asserts that the instance exists.
+- `size()` returns the number of events.
+- `event_at(index)` returns the event at an index without changing shared state.
   Each event contains a request index, an event kind, and a timestamp.
+
+Each simulation constructs a separate `SchedulerCursor`.
+The cursor references the shared scheduler and stores its own position.
+A thread-local pointer identifies the active cursor.
+This change does not add threads. Simulations still execute sequentially.
+
+The cursor provides these methods:
+
+- `SchedulerCursor::get()` returns the active cursor for the current thread.
+  It asserts that the cursor exists and its position is zero.
+  Policies call this method instead of receiving a cursor argument.
+- `next_event()` returns the next event and advances only this cursor.
   At the end, the method returns no event.
 - `exhausted()` reports whether the cursor reached the end.
-- `discard_remaining()` moves the cursor to the end without cache operations.
-  Policies use this method when a simulation stops early.
-- `reset()` returns the cursor to zero without reconstructing the sequence.
-  It asserts that the previous iteration reached the end or explicitly discarded the remaining events.
 
-Policies reset the scheduler after each iteration.
-A return before iteration leaves the cursor at zero.
-An early return discards the remaining events before reset.
-The next simulation starts with the same scheduler instance and a cursor of zero.
+The cursor constructor asserts that no other cursor is active on the current thread.
+The cursor destructor removes its registration, including after an early return or exception.
+The next simulation creates a fresh cursor at position zero.
+No reset or discard operation is necessary.
+The shared scheduler contains no cursor or cache blocks.
+
 The recorded-time scheduler stores two 64-bit event codes per request, or 16 bytes per request.
 It reads timestamps from the existing timing arrays. The owner must keep these arrays alive until it destroys the scheduler.
 The selected scheduler registers itself during construction and removes its registration during destruction.

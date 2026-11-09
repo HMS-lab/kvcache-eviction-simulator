@@ -302,36 +302,62 @@ struct ScheduledEvent {
   std::uint64_t timestamp;
 };
 
+// One selected, read-only schedule, constructed before simulations start.
+// Its owner and the referenced SimulationInput must outlive all cursors.
 class RequestScheduler {
  public:
   virtual ~RequestScheduler() { instance_ = nullptr; }
   RequestScheduler(const RequestScheduler&) = delete;
   RequestScheduler& operator=(const RequestScheduler&) = delete;
 
-  static RequestScheduler& get() {
+  static const RequestScheduler& get() {
     assert(instance_);
-    assert(instance_->at_start());
     return *instance_;
   }
-  virtual std::optional<ScheduledEvent> next_event() = 0;
-  virtual bool exhausted() const = 0;
-  virtual void discard_remaining() = 0;
-
-  void reset() {
-    assert(exhausted());
-    reset_impl();
-  }
+  virtual std::uint64_t size() const = 0;
+  virtual ScheduledEvent event_at(std::uint64_t index) const = 0;
 
  protected:
   RequestScheduler() {
     assert(!instance_);
     instance_ = this;
   }
-  virtual bool at_start() const = 0;
-  virtual void reset_impl() = 0;
 
  private:
-  inline static RequestScheduler* instance_ = nullptr;
+  inline static const RequestScheduler* instance_ = nullptr;
+};
+
+// Each simulation owns a fresh cursor. Only its active pointer is thread-local;
+// the schedule and event storage are shared through const references.
+class SchedulerCursor {
+ public:
+  SchedulerCursor() : schedule_(RequestScheduler::get()) {
+    assert(!active_);
+    assert(position_ == 0);
+    active_ = this;
+  }
+  ~SchedulerCursor() {
+    assert(active_ == this);
+    active_ = nullptr;
+  }
+  SchedulerCursor(const SchedulerCursor&) = delete;
+  SchedulerCursor& operator=(const SchedulerCursor&) = delete;
+
+  static SchedulerCursor& get() {
+    assert(active_);
+    assert(active_->position_ == 0);
+    return *active_;
+  }
+  std::optional<ScheduledEvent> next_event() {
+    if (exhausted()) return std::nullopt;
+    return schedule_.event_at(position_++);
+  }
+  bool exhausted() const { return position_ == schedule_.size(); }
+
+ private:
+  const RequestScheduler& schedule_;
+  std::uint64_t position_ = 0;
+  inline static thread_local SchedulerCursor* active_ = nullptr;
 };
 
 // Generate adjacent read/write events without storing a timeline. Timestamps are unused.
@@ -340,22 +366,15 @@ class SequentialRequestScheduler final : public RequestScheduler {
   explicit SequentialRequestScheduler(std::uint32_t request_count)
       : event_count_(2ULL * request_count) {}
 
-  std::optional<ScheduledEvent> next_event() override {
-    if (exhausted()) return std::nullopt;
-    const auto event = cursor_++;
-    return ScheduledEvent{static_cast<std::uint32_t>(event / 2),
-      event % 2 ? ScheduledEventKind::Completion : ScheduledEventKind::Arrival, 0};
+  std::uint64_t size() const override { return event_count_; }
+  ScheduledEvent event_at(std::uint64_t index) const override {
+    assert(index < size());
+    return ScheduledEvent{static_cast<std::uint32_t>(index / 2),
+      index % 2 ? ScheduledEventKind::Completion : ScheduledEventKind::Arrival, 0};
   }
-  bool exhausted() const override { return cursor_ == event_count_; }
-  void discard_remaining() override { cursor_ = event_count_; }
-
- protected:
-  bool at_start() const override { return cursor_ == 0; }
-  void reset_impl() override { cursor_ = 0; }
 
  private:
   const std::uint64_t event_count_;
-  std::uint64_t cursor_ = 0;
 };
 
 class RecordedTimeScheduler final : public RequestScheduler {
@@ -388,21 +407,15 @@ class RecordedTimeScheduler final : public RequestScheduler {
     }
   }
 
-  std::optional<ScheduledEvent> next_event() override {
-    if (exhausted()) return std::nullopt;
-    const auto encoded = events_[cursor_++];
+  std::uint64_t size() const override { return events_.size(); }
+  ScheduledEvent event_at(std::uint64_t index) const override {
+    assert(index < size());
+    const auto encoded = events_[index];
     const auto request = static_cast<std::uint32_t>(encoded >> 1);
     const auto kind = (encoded & 1) ? ScheduledEventKind::Completion : ScheduledEventKind::Arrival;
     return ScheduledEvent{request, kind,
       kind == ScheduledEventKind::Arrival ? arrivals_[request] : completions_[request]};
   }
-
-  bool exhausted() const override { return cursor_ == events_.size(); }
-  void discard_remaining() override { cursor_ = events_.size(); }
-
- protected:
-  bool at_start() const override { return cursor_ == 0; }
-  void reset_impl() override { cursor_ = 0; }
 
  private:
   void append(std::uint32_t request, ScheduledEventKind kind) {
@@ -413,7 +426,6 @@ class RecordedTimeScheduler final : public RequestScheduler {
   const std::vector<std::uint64_t>& arrivals_;
   const std::vector<std::uint64_t>& completions_;
   std::vector<std::uint64_t> events_;
-  std::size_t cursor_ = 0;
 };
 
 PrefixPlan build_prefix_plan(const std::vector<std::uint32_t>& ids,
@@ -540,7 +552,8 @@ Result underfilled_result(const SimulationInput& input, const Options& options) 
 Result simulate_ceiling(const SimulationInput& input, const Options& options) {
   Result result;
   std::vector<std::uint8_t> seen(input.prefix.parent.size(), 0);
-  auto& scheduler = RequestScheduler::get();
+  SchedulerCursor cursor;
+  auto& scheduler = SchedulerCursor::get();
   while (const auto event = scheduler.next_event()) {
     const auto request = event->request;
     const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
@@ -564,7 +577,6 @@ Result simulate_ceiling(const SimulationInput& input, const Options& options) {
       }
     }
   }
-  scheduler.reset();
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
 }
@@ -579,15 +591,14 @@ Result simulate_fifo(const SimulationInput& input, std::uint32_t capacity, const
   std::uint32_t cache_size = 0;
   bool full_before_measurement = false;
 
-  auto& scheduler = RequestScheduler::get();
+  SchedulerCursor cursor;
+  auto& scheduler = SchedulerCursor::get();
   while (const auto event = scheduler.next_event()) {
     const auto request = event->request;
     const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
     const std::uint64_t end = input.request_ends[request];
     if (event->kind == ScheduledEventKind::Arrival) {
       if (request >= options.warmup_requests && !full_before_measurement) {
-        scheduler.discard_remaining();
-        scheduler.reset();
         return underfilled_result(input, options);
       }
       const bool measured = request >= options.warmup_requests;
@@ -628,7 +639,6 @@ Result simulate_fifo(const SimulationInput& input, std::uint32_t capacity, const
       }
     }
   }
-  scheduler.reset();
   if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
@@ -694,15 +704,14 @@ Result simulate_flat_lru(const SimulationInput& input, std::uint32_t capacity, c
   Result result;
   FlatLruCache cache(capacity, touch_on_put);
   bool full_before_measurement = false;
-  auto& scheduler = RequestScheduler::get();
+  SchedulerCursor cursor;
+  auto& scheduler = SchedulerCursor::get();
   while (const auto event = scheduler.next_event()) {
     const auto request = event->request;
     const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
     const std::uint64_t end = input.request_ends[request];
     if (event->kind == ScheduledEventKind::Arrival) {
       if (request >= options.warmup_requests && !full_before_measurement) {
-        scheduler.discard_remaining();
-        scheduler.reset();
         return underfilled_result(input, options);
       }
       const std::uint64_t request_hits = read_flat_lru_prefix(cache, input, start, end);
@@ -715,7 +724,6 @@ Result simulate_flat_lru(const SimulationInput& input, std::uint32_t capacity, c
       if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
     }
   }
-  scheduler.reset();
   if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
@@ -818,7 +826,8 @@ Result simulate_hyper_clock(const SimulationInput& input, std::uint32_t capacity
   Result result;
   HyperClockCache cache(capacity, options.hyper_clock_max_score);
   bool full_before_measurement = false;
-  auto& scheduler = RequestScheduler::get();
+  SchedulerCursor cursor;
+  auto& scheduler = SchedulerCursor::get();
   std::unordered_map<std::uint32_t, std::uint64_t> write_starts;
   while (const auto event = scheduler.next_event()) {
     const auto request = event->request;
@@ -826,8 +835,6 @@ Result simulate_hyper_clock(const SimulationInput& input, std::uint32_t capacity
     const std::uint64_t end = input.request_ends[request];
     if (event->kind == ScheduledEventKind::Arrival) {
       if (request >= options.warmup_requests && !full_before_measurement) {
-        scheduler.discard_remaining();
-        scheduler.reset();
         return underfilled_result(input, options);
       }
       const auto read = read_hyper_clock_prefix(cache, input, start, end);
@@ -848,7 +855,6 @@ Result simulate_hyper_clock(const SimulationInput& input, std::uint32_t capacity
       if (request < options.warmup_requests && cache.size() >= capacity) full_before_measurement = true;
     }
   }
-  scheduler.reset();
   if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
@@ -997,15 +1003,14 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
     }
   };
 
-  auto& scheduler = RequestScheduler::get();
+  SchedulerCursor cursor;
+  auto& scheduler = SchedulerCursor::get();
   while (const auto event = scheduler.next_event()) {
     const auto request = event->request;
     const std::uint64_t start = request ? input.request_ends[request - 1] : 0;
     const std::uint64_t end = input.request_ends[request];
     if (event->kind == ScheduledEventKind::Arrival) {
       if (request >= options.warmup_requests && !full_before_measurement) {
-        scheduler.discard_remaining();
-        scheduler.reset();
         return underfilled_result(input, options);
       }
       if (optimal) {
@@ -1047,7 +1052,6 @@ Result simulate_trie_policy(const SimulationInput& input, std::uint32_t capacity
       }
     }
   }
-  scheduler.reset();
   if (!full_before_measurement || result.total_tokens == 0) return underfilled_result(input, options);
   result.measurement_start_request = static_cast<std::int64_t>(options.warmup_requests);
   return result;
@@ -1181,7 +1185,8 @@ struct SampledCache {
 };
 
 Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, const Options& options, bool touch_on_put = true) {
-  auto& scheduler = RequestScheduler::get();
+  SchedulerCursor cursor;
+  auto& scheduler = SchedulerCursor::get();
   SampledCache cache(capacity, options, capacity ? input.prefix.parent.size() : 0, touch_on_put);
   auto label = options.progress_label.empty()
       ? std::string(touch_on_put ? "sampling-lru-touch-on-put" : "sampling-lru-touch-on-get") +
@@ -1192,8 +1197,6 @@ Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, co
   SampledProgress progress{options, cache.counters, 2ULL * input.request_ends.size(), 0, 0, label};
   if (!capacity) {
     progress.report(" | skipped: zero capacity");
-    scheduler.discard_remaining();
-    scheduler.reset();
     return no_cache_result(input, options);
   }
   if (options.progress) {
@@ -1216,8 +1219,6 @@ Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, co
     } else {
       if (request >= options.warmup_requests && !full) {
         progress.report(" | stopped: cache underfilled at measurement boundary");
-        scheduler.discard_remaining();
-        scheduler.reset();
         return underfilled_result(input, options);
       }
       bool alive = true;
@@ -1234,7 +1235,6 @@ Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, co
     if (cache.progress) progress.tick();
   }
   progress.report();
-  scheduler.reset();
   if (!full || !result.total_tokens) return underfilled_result(input, options);
   return result;
 }
@@ -1318,8 +1318,8 @@ void print_all_results(std::uint64_t cache_blocks, const AllResults& results, st
   std::cout << "}\n";
 }
 
-// Construct one selected scheduler for the entire run. Policies use its singleton accessor.
-std::unique_ptr<RequestScheduler> make_scheduler(const SimulationInput& input, const Options& options) {
+// Construct one selected, read-only schedule for all simulation cursors.
+std::unique_ptr<const RequestScheduler> make_scheduler(const SimulationInput& input, const Options& options) {
   if (options.scheduler == "sequential")
     return std::make_unique<SequentialRequestScheduler>(input.request_ends.size());
   if (options.scheduler == "recorded") {
@@ -1419,7 +1419,7 @@ class SimulationRunner {
  private:
   const SimulationInput& input;
   const Options& options;
-  std::unique_ptr<RequestScheduler> scheduler;
+  std::unique_ptr<const RequestScheduler> scheduler;
 };
 
 }  // namespace

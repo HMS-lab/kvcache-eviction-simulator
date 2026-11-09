@@ -16,45 +16,41 @@ SOURCE = Path(__file__).resolve().parents[1] / 'src/kvcache_sim/resources/kv-cac
 HARNESS = r'''
 using Kind = ScheduledEventKind;
 using Event = std::tuple<unsigned, Kind, std::uint64_t>;
-std::vector<Event> drain(RequestScheduler& scheduler) {
+std::vector<Event> drain(SchedulerCursor& scheduler) {
   std::vector<Event> result;
   while (auto e = scheduler.next_event()) result.emplace_back(e->request, e->kind, e->timestamp);
   return result;
 }
 class AlternateScheduler final : public RequestScheduler {
  public:
-  std::optional<ScheduledEvent> next_event() override {
-    if (exhausted()) return std::nullopt;
-    auto n = cursor++;
-    return ScheduledEvent{n / 2, n % 2 ? Kind::Completion : Kind::Arrival, n};
+  std::uint64_t size() const override { return 4; }
+  ScheduledEvent event_at(std::uint64_t n) const override {
+    assert(n < size());
+    return ScheduledEvent{static_cast<unsigned>(n / 2), n % 2 ? Kind::Completion : Kind::Arrival, n};
   }
-  bool exhausted() const override { return cursor == 4; }
-  void discard_remaining() override { cursor = 4; }
- protected:
-  bool at_start() const override { return cursor == 0; }
-  void reset_impl() override { cursor = 0; }
- private:
-  unsigned cursor = 0;
 };
-void sequential_lifecycle(bool premature) {
+void sequential_lifecycle() {
   {
-    SequentialRequestScheduler concrete(3);
-    auto& scheduler = RequestScheduler::get();
-    assert(&scheduler == &concrete);
-    if (premature) { scheduler.next_event(); scheduler.reset(); return; }
+    const SequentialRequestScheduler concrete(3);
+    assert(&RequestScheduler::get() == &concrete);
     const std::vector<Event> expected{
       {0,Kind::Arrival,0},{0,Kind::Completion,0},
       {1,Kind::Arrival,0},{1,Kind::Completion,0},
       {2,Kind::Arrival,0},{2,Kind::Completion,0}};
-    assert(drain(scheduler) == expected);
-    assert(scheduler.exhausted() && !scheduler.next_event());
-    scheduler.reset(); assert(drain(scheduler) == expected);
-    scheduler.reset(); scheduler.next_event(); scheduler.discard_remaining();
-    scheduler.reset(); assert(drain(scheduler) == expected);
+    for (unsigned run = 0; run < 3; ++run) {
+      SchedulerCursor cursor;
+      assert(&SchedulerCursor::get() == &cursor);
+      assert(drain(cursor) == expected);
+      assert(cursor.exhausted() && !cursor.next_event());
+    }
+    { SchedulerCursor cursor; cursor.next_event(); } // Early return needs no cleanup call.
+    { SchedulerCursor cursor; assert(drain(cursor) == expected); }
+    try { SchedulerCursor cursor; cursor.next_event(); throw 1; } catch (int) {}
+    { SchedulerCursor cursor; assert(drain(cursor) == expected); }
   }
-  SequentialRequestScheduler empty(0);
-  assert(empty.exhausted() && !empty.next_event());
-  empty.reset();
+  const SequentialRequestScheduler empty(0);
+  SchedulerCursor cursor;
+  assert(cursor.exhausted() && !cursor.next_event());
 }
 void shared_policy_scheduler() {
   SimulationInput input;
@@ -65,8 +61,8 @@ void shared_policy_scheduler() {
   for (const auto* strategy : {"sequential", "recorded"}) {
     Options options; options.warmup_requests = 1; options.scheduler = strategy;
     SimulationRunner runner(input, options);
-    RequestScheduler* selected = &RequestScheduler::get();
-    assert((dynamic_cast<RecordedTimeScheduler*>(selected) != nullptr) == (options.scheduler == "recorded"));
+    const RequestScheduler* selected = &RequestScheduler::get();
+    assert((dynamic_cast<const RecordedTimeScheduler*>(selected) != nullptr) == (options.scheduler == "recorded"));
     for (unsigned capacity : {1,99,0,1}) {
       for (const auto* policy : {"ceiling","fifo","lru","lru-flat-touch-on-put","flat-lru-memcache","hyper-clock","optimal","sampling-lru-touch-on-put","sampling-lru-touch-on-get"}) {
         const auto result = runner.run(policy, capacity);
@@ -111,30 +107,31 @@ void legacy_regression() {
   auto ceiling = runner.run("ceiling", 0);
   assert(ceiling.hit_tokens == 37 && ceiling.total_tokens == 40);
 }
-void lifecycle(bool premature) {
-  std::vector<std::uint64_t> arrivals{0,0,1,2,2}, completions{2,2,1,2,4};
-  std::vector<std::uint32_t> ranks{1,0,2,3,4};
+void lifecycle() {
+  const std::vector<std::uint64_t> arrivals{0,0,1,2,2}, completions{2,2,1,2,4};
+  const std::vector<std::uint32_t> ranks{1,0,2,3,4};
   {
-  RecordedTimeScheduler concrete(arrivals,completions,ranks);
-  RequestScheduler& scheduler = RequestScheduler::get();
-  assert(&scheduler == &concrete);
-  if (premature) { scheduler.next_event(); scheduler.reset(); return; }
-  const std::vector<Event> expected{
-    {0,Kind::Arrival,0},{1,Kind::Arrival,0},{2,Kind::Arrival,1},
-    {2,Kind::Completion,1},{1,Kind::Completion,2},{0,Kind::Completion,2},
-    {3,Kind::Arrival,2},{4,Kind::Arrival,2},{3,Kind::Completion,2},{4,Kind::Completion,4}};
-  assert(drain(scheduler) == expected);
-  assert(scheduler.exhausted());
-  assert(!scheduler.next_event() && !scheduler.next_event());
-  scheduler.reset(); assert(drain(scheduler) == expected);
-  scheduler.reset(); scheduler.next_event(); scheduler.discard_remaining();
-  assert(scheduler.exhausted()); scheduler.discard_remaining();
-  scheduler.reset(); assert(drain(scheduler) == expected);
+    const RecordedTimeScheduler concrete(arrivals,completions,ranks);
+    assert(&RequestScheduler::get() == &concrete);
+    const std::vector<Event> expected{
+      {0,Kind::Arrival,0},{1,Kind::Arrival,0},{2,Kind::Arrival,1},
+      {2,Kind::Completion,1},{1,Kind::Completion,2},{0,Kind::Completion,2},
+      {3,Kind::Arrival,2},{4,Kind::Arrival,2},{3,Kind::Completion,2},{4,Kind::Completion,4}};
+    for (unsigned run = 0; run < 3; ++run) {
+      SchedulerCursor cursor;
+      assert(drain(cursor) == expected);
+      assert(cursor.exhausted() && !cursor.next_event() && !cursor.next_event());
+    }
+    { SchedulerCursor cursor; cursor.next_event(); }
+    { SchedulerCursor cursor; assert(drain(cursor) == expected); }
+    // Indexed reads never consume the shared schedule.
+    assert(concrete.event_at(0).request == 0 && concrete.size() == 10);
   }
-  std::vector<std::uint64_t> empty;
-  std::vector<std::uint32_t> no_ranks;
-  RecordedTimeScheduler none(empty,empty,no_ranks);
-  assert(none.exhausted() && !none.next_event()); none.reset();
+  const std::vector<std::uint64_t> empty;
+  const std::vector<std::uint32_t> no_ranks;
+  const RecordedTimeScheduler none(empty,empty,no_ranks);
+  SchedulerCursor cursor;
+  assert(cursor.exhausted() && !cursor.next_event());
 }
 void alternate() {
   SimulationInput input;
@@ -143,7 +140,7 @@ void alternate() {
   input.prefix = build_prefix_plan(input.ids,input.request_ends);
   Options options; options.warmup_requests = 1;
   AlternateScheduler concrete;
-  RequestScheduler& scheduler = RequestScheduler::get();
+  const RequestScheduler& scheduler = RequestScheduler::get();
   assert(&scheduler == &concrete);
   auto result = simulate_sampled(input,1,options);
   assert(result.hit_tokens == 64 && result.total_tokens == 64);
@@ -157,25 +154,25 @@ void alternate() {
 }
 void singleton_guard(const std::string& mode) {
   if (mode == "uninitialized") { RequestScheduler::get(); return; }
-  AlternateScheduler scheduler;
+  AlternateScheduler schedule;
   if (mode == "duplicate") { AlternateScheduler duplicate; return; }
-  scheduler.next_event();
-  if (mode == "consumed") drain(scheduler);
-  if (mode == "discarded") scheduler.discard_remaining();
-  RequestScheduler::get();
+  if (mode == "missing-cursor") { SchedulerCursor::get(); return; }
+  SchedulerCursor cursor;
+  if (mode == "duplicate-cursor") { SchedulerCursor duplicate; return; }
+  cursor.next_event();
+  if (mode == "consumed") drain(cursor);
+  SchedulerCursor::get();
 }
 int main(int argc, char** argv) {
   assert(argc >= 2);
   std::string mode = argv[1];
-  if (mode == "sequential") sequential_lifecycle(false);
-  else if (mode == "sequential-premature") sequential_lifecycle(true);
+  if (mode == "sequential") sequential_lifecycle();
   else if (mode == "shared-policy-scheduler") shared_policy_scheduler();
   else if (mode == "legacy-regression") legacy_regression();
-  else if (mode == "lifecycle") lifecycle(false);
-  else if (mode == "premature") lifecycle(true);
+  else if (mode == "lifecycle") lifecycle();
   else if (mode == "alternate") alternate();
   else if (mode == "uninitialized" || mode == "duplicate" || mode == "partial"
-           || mode == "consumed" || mode == "discarded") singleton_guard(mode);
+           || mode == "consumed" || mode == "missing-cursor" || mode == "duplicate-cursor") singleton_guard(mode);
   else {
     auto expected = static_cast<unsigned>(std::stoul(mode));
     const auto result = simulator_main(argc-1,argv+1);
@@ -210,10 +207,10 @@ class NativeRequestSchedulerTests(unittest.TestCase):
         if compiled.returncode:
             raise AssertionError(compiled.stderr)
 
-    def test_order_exhaustion_reset_and_discard(self):
+    def test_recorded_order_and_fresh_cursors(self):
         subprocess.run([str(self.binary), 'lifecycle'], check=True, capture_output=True)
 
-    def test_sequential_order_exhaustion_reset_and_discard(self):
+    def test_sequential_order_and_fresh_cursors(self):
         subprocess.run([str(self.binary), 'sequential'], check=True, capture_output=True)
 
     def test_selected_scheduler_shared_after_all_return_paths(self):
@@ -222,22 +219,8 @@ class NativeRequestSchedulerTests(unittest.TestCase):
     def test_legacy_policies_match_results_before_extraction(self):
         subprocess.run([str(self.binary), 'legacy-regression'], check=True, capture_output=True)
 
-    def test_sequential_reset_guard(self):
-        for mode in ('sequential-premature',):
-            with self.subTest(mode=mode):
-                result = subprocess.run([str(self.binary), mode], capture_output=True, text=True,
-                                        cwd=self.directory.name)
-                self.assertEqual(result.returncode, -signal.SIGABRT)
-                self.assertIn('Assertion', result.stderr)
-
-    def test_premature_reset_asserts(self):
-        result = subprocess.run([str(self.binary), 'premature'], capture_output=True, text=True,
-                                cwd=self.directory.name)
-        self.assertEqual(result.returncode, -signal.SIGABRT)
-        self.assertIn('exhausted()', result.stderr)
-
     def test_singleton_rejects_missing_duplicate_or_nonzero_iterator(self):
-        for mode in ('uninitialized', 'duplicate', 'partial', 'consumed', 'discarded'):
+        for mode in ('uninitialized', 'duplicate', 'missing-cursor', 'duplicate-cursor', 'partial', 'consumed'):
             with self.subTest(mode=mode):
                 result = subprocess.run([str(self.binary), mode], capture_output=True, text=True,
                                         cwd=self.directory.name)
