@@ -42,6 +42,7 @@ struct Options {
   bool progress = false;
   std::string arrivals_path, completions_path, order_path;
   std::uint64_t sampled_threshold = 10000000, sampled_seed = 0;
+  std::vector<std::uint32_t> sampled_sizes{16};
   std::uint32_t sampled_size = 16, sampled_max_evictions = 0xffffffffU;
 };
 
@@ -139,9 +140,23 @@ Options parse_args(int argc, char** argv) {
     else if (arg == "--sampled-lru-threshold-us") options.sampled_threshold = parse_sampled_u64(require_value(arg), arg);
     else if (arg == "--sampled-lru-seed") options.sampled_seed = parse_sampled_u64(require_value(arg), arg);
     else if (arg == "--sampled-lru-sample-size") {
-      auto n = parse_sampled_u64(require_value(arg), arg);
-      if (!n || n > 0xffffffffULL) throw std::runtime_error("Invalid sampled sample size");
-      options.sampled_size = n;
+      std::string value = require_value(arg);
+      options.sampled_sizes.clear();
+      std::size_t start = 0;
+      do {
+        auto end = value.find(',', start);
+        auto part = value.substr(start, end == std::string::npos ? end : end-start);
+        auto first = part.find_first_not_of(" \t\r\n");
+        auto last = part.find_last_not_of(" \t\r\n");
+        if (first == std::string::npos) throw std::runtime_error("Empty sampled sample size");
+        auto n = parse_sampled_u64(part.substr(first, last-first+1), arg);
+        if (!n || n > 0xffffffffULL) throw std::runtime_error("Invalid sampled sample size");
+        if (std::find(options.sampled_sizes.begin(), options.sampled_sizes.end(), n) == options.sampled_sizes.end())
+          options.sampled_sizes.push_back(n);
+        if (end == std::string::npos) break;
+        start = end + 1;
+      } while (true);
+      options.sampled_size = options.sampled_sizes.front();
     }
     else if (arg == "--sampled-lru-max-evictions") {
       auto n = parse_sampled_u64(require_value(arg), arg);
@@ -1162,7 +1177,7 @@ bool has_policy(const Options& options, const std::string& policy) {
 std::uint64_t selected_policy_count(const Options& options) {
   std::uint64_t count = 0;
   for (const auto* policy : {"sampling-lru-touch-on-put", "sampling-lru-touch-on-get", "fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal"}) {
-    if (has_policy(options, policy)) ++count;
+    if (has_policy(options, policy)) count += std::string(policy).find("sampling-lru-") == 0 ? options.sampled_sizes.size() : 1;
   }
   return count;
 }
@@ -1259,6 +1274,29 @@ class SimulationRunner {
     };
   }
 
+  std::vector<std::string> selected_names() const {
+    if (options.policy != "batch" && options.policy != "all") return {options.policy};
+    if (!options.policies.empty()) return options.policies;
+    return {"fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal", "sampling-lru-touch-on-put", "sampling-lru-touch-on-get"};
+  }
+
+  void print_grouped_results() {
+    std::cout << "{\"cacheBlocks\":" << options.capacity << ",\"trieNodeCount\":" << input.prefix.parent.size();
+    for (const auto& policy : selected_names()) {
+      const bool sampling = policy.find("sampling-lru-") == 0;
+      for (auto size : sampling ? options.sampled_sizes : std::vector<std::uint32_t>{0}) {
+        Options configured = options;
+        configured.sampled_size = size;
+        const auto id = sampling ? policy + ":sample-size=" + std::to_string(size) : policy;
+        auto result = sampling ? simulate_sampled(input, options.capacity, configured, policy == "sampling-lru-touch-on-put") : run(policy, options.capacity);
+        std::cout << ",\"" << id << "\":{";
+        print_named_result(policy.c_str(), options.capacity, result, options.warmup_requests);
+        std::cout << "}";
+      }
+    }
+    std::cout << "}\n";
+  }
+
   void print_batch_results() {
     const std::uint64_t trie_node_count = input.prefix.parent.size();
     const std::uint64_t policy_count = selected_policy_count(options);
@@ -1281,81 +1319,30 @@ class SimulationRunner {
     std::uint64_t capacity_index = 0;
     for (std::uint32_t capacity : options.capacities) {
       ++capacity_index;
-      std::uint64_t policy_index = 0;
-      auto evaluate = [&](const std::string& policy) {
-        ++policy_index;
-        const std::string label = policy + " (cache capacity " + std::to_string(capacity_index) + "/" +
-            std::to_string(options.capacities.size()) + ", " + std::to_string(capacity) + " blocks; policy " +
-            std::to_string(policy_index) + "/" + std::to_string(policy_count) + ")";
-        report_progress(options, completed_steps, total_steps, label);
-        Result result = run(policy, capacity);
-        ++completed_steps;
-        report_progress(options, completed_steps, total_steps, label);
-        return result;
-      };
-      Result fifo;
-      Result lru;
-      Result flat_lru_touch_on_put;
-      Result flat_lru_memcache;
-      Result hyper_clock;
-      Result optimal;
-      Result sampled;
-      Result sampled_get;
-      const bool run_sampled = has_policy(options, "sampling-lru-touch-on-put");
-      if (run_sampled) sampled = evaluate("sampling-lru-touch-on-put");
-      const bool run_sampled_get = has_policy(options, "sampling-lru-touch-on-get");
-      if (run_sampled_get) sampled_get = evaluate("sampling-lru-touch-on-get");
-      if (has_policy(options, "fifo")) fifo = evaluate("fifo");
-      if (has_policy(options, "lru")) lru = evaluate("lru");
-      if (has_policy(options, "lru-flat-touch-on-put")) flat_lru_touch_on_put = evaluate("lru-flat-touch-on-put");
-      if (has_policy(options, "flat-lru-memcache")) flat_lru_memcache = evaluate("flat-lru-memcache");
-      if (has_policy(options, "hyper-clock")) hyper_clock = evaluate("hyper-clock");
-      if (has_policy(options, "optimal")) optimal = evaluate("optimal");
-
       if (!first_point) std::cout << ",";
       first_point = false;
-      std::cout << "{"
-                << "\"cacheBlocks\":" << capacity;
-      if (has_policy(options, "fifo")) {
-        std::cout << ",\"fifo\":{";
-        print_named_result("fifo", capacity, fifo, options.warmup_requests);
-        std::cout << "}";
+      std::cout << "{\"cacheBlocks\":" << capacity;
+      std::uint64_t policy_index = 0;
+      auto names = selected_names();
+      std::stable_partition(names.begin(), names.end(), [](const auto& p) { return p.find("sampling-lru-") == 0; });
+      for (const auto& policy : names) {
+        const bool sampling = policy.find("sampling-lru-") == 0;
+        const auto sizes = sampling ? options.sampled_sizes : std::vector<std::uint32_t>{0};
+        for (auto size : sizes) {
+          const auto id = sampling && sizes.size() > 1 ? policy + ":sample-size=" + std::to_string(size) : policy;
+          Options configured = options;
+          configured.sampled_size = size;
+          const std::string label = id + " (cache capacity " + std::to_string(capacity_index) + "/" + std::to_string(options.capacities.size()) + ", " + std::to_string(capacity) + " blocks; policy " + std::to_string(++policy_index) + "/" + std::to_string(policy_count) + ")";
+          report_progress(options, completed_steps, total_steps, label);
+          Result result = sampling ? simulate_sampled(input, capacity, configured, policy == "sampling-lru-touch-on-put") : run(policy, capacity);
+          ++completed_steps;
+          report_progress(options, completed_steps, total_steps, label);
+          std::cout << ",\"" << id << "\":{";
+          print_named_result(policy.c_str(), capacity, result, options.warmup_requests);
+          std::cout << "}";
+        }
       }
-      if (has_policy(options, "lru")) {
-        std::cout << ",\"lru\":{";
-        print_named_result("lru", capacity, lru, options.warmup_requests);
-        std::cout << "}";
-      }
-      if (has_policy(options, "lru-flat-touch-on-put")) {
-        std::cout << ",\"lru-flat-touch-on-put\":{";
-        print_named_result("lru-flat-touch-on-put", capacity, flat_lru_touch_on_put, options.warmup_requests);
-        std::cout << "}";
-      }
-      if (has_policy(options, "flat-lru-memcache")) {
-        std::cout << ",\"flat-lru-memcache\":{";
-        print_named_result("flat-lru-memcache", capacity, flat_lru_memcache, options.warmup_requests);
-        std::cout << "}";
-      }
-      if (has_policy(options, "hyper-clock")) {
-        std::cout << ",\"hyper-clock\":{";
-        print_named_result("hyper-clock", capacity, hyper_clock, options.warmup_requests);
-        std::cout << "}";
-      }
-      if (has_policy(options, "optimal")) {
-        std::cout << ",\"optimal\":{";
-        print_named_result("optimal", capacity, optimal, options.warmup_requests);
-        std::cout << "}";
-      }
-      if (run_sampled) {
-        std::cout << ",\"sampling-lru-touch-on-put\":{";
-        print_named_result("sampling-lru-touch-on-put", capacity, sampled, options.warmup_requests);
-        std::cout << "}";
-      }
-      if (run_sampled_get) {
-        std::cout << ",\"sampling-lru-touch-on-get\":{";
-        print_named_result("sampling-lru-touch-on-get", capacity, sampled_get, options.warmup_requests);
-        std::cout << "}";
-      }
+
       std::cout << "}";
     }
     report_progress(options, total_steps, total_steps, "simulation complete");
@@ -1372,7 +1359,8 @@ class SimulationRunner {
 
 int main(int argc, char** argv) {
   try {
-    const Options options = parse_args(argc, argv);
+    Options options = parse_args(argc, argv);
+    const bool grouped = options.sampled_sizes.size() > 1 && (options.policy == "all" || options.policy.find("sampling-lru-") == 0);
     if (options.policy == "build-next") {
       build_next_file(options);
       std::cout << "{\"policy\":\"build-next\",\"cacheBlocks\":0,\"hitTokens\":0,\"totalTokens\":0,\"hitRate\":0}\n";
@@ -1383,7 +1371,8 @@ int main(int argc, char** argv) {
     const SimulationInput input = load_simulation_input(options);
     SimulationRunner runner(input, options);
     const std::uint64_t trie_node_count = input.prefix.parent.size();
-    if (options.policy == "batch") runner.print_batch_results();
+    if (grouped) runner.print_grouped_results();
+    else if (options.policy == "batch") runner.print_batch_results();
     else if (options.policy == "all") print_all_results(options.capacity, runner.simulate_all(options.capacity), trie_node_count, options.warmup_requests);
     else print_result(options.policy, options.capacity, runner.run(options.policy, options.capacity), trie_node_count, options.warmup_requests);
     return 0;

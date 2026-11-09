@@ -10,11 +10,12 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from collections.abc import Sequence
 from typing import Callable, Iterable
 
 from .policies import PolicyResult, validate_hyper_clock_max_score
 from ._resources import package_resource_path, user_temp_suffix
-from .sampled import SAMPLING_POLICIES, validate_parameters
+from .sampled import SAMPLING_POLICIES, validate_parameters, normalize_sample_sizes, build_runs
 from .trace import TraceData
 
 UINT32_MAX = 2**32 - 1
@@ -146,7 +147,7 @@ def run_cpp_sweep(
     scheduler: str,
     hyper_clock_max_score: int = 3,
     sampled_lru_threshold_seconds: float = 10.0,
-    sampled_lru_sample_size: int = 16,
+    sampled_lru_sample_size: int | Sequence[int] = 16,
     sampled_lru_seed: int = 0,
     sampled_lru_max_evictions: int | None = None,
     release_trace_data: bool = False,
@@ -154,9 +155,10 @@ def run_cpp_sweep(
 ) -> CppSweepResult:
     """Run native replay; optionally consume the trace's event lists after writing."""
     validate_hyper_clock_max_score(hyper_clock_max_score)
+    sample_sizes = normalize_sample_sizes(sampled_lru_sample_size)
     if scheduler not in {"recorded", "sequential"}:
         raise ValueError(f"Unsupported scheduler: {scheduler}")
-    threshold_us = (validate_parameters(sampled_lru_threshold_seconds, sampled_lru_sample_size,
+    threshold_us = (validate_parameters(sampled_lru_threshold_seconds, sample_sizes[0],
                                         sampled_lru_seed, sampled_lru_max_evictions)
                     if any(p in SAMPLING_POLICIES for p in policies) else 10_000_000)
     if scheduler == "recorded" and any(values is None or len(values) != trace.request_count for values in
@@ -214,7 +216,7 @@ def run_cpp_sweep(
                 command.extend((flag, str(path)))
         if any(p in SAMPLING_POLICIES for p in policies):
             command.extend(("--sampled-lru-threshold-us", str(threshold_us),
-                            "--sampled-lru-sample-size", str(sampled_lru_sample_size),
+                            "--sampled-lru-sample-size", ",".join(map(str, sample_sizes)),
                             "--sampled-lru-seed", str(sampled_lru_seed)))
         if any(p in SAMPLING_POLICIES for p in policies) and sampled_lru_max_evictions is not None:
             command.extend(("--sampled-lru-max-evictions", str(sampled_lru_max_evictions)))
@@ -238,9 +240,9 @@ def run_cpp_sweep(
     results: dict[tuple[str, int], PolicyResult] = {}
     for point in payload.get("points", []):
         capacity = int(point["cacheBlocks"])
-        for policy in policies:
-            if policy in point:
-                results[(policy, capacity)] = _to_policy_result(policy, capacity, warmup_requests, point[policy])
+        for run in build_runs(policies, sample_sizes):
+            if run.id in point:
+                results[(run.id, capacity)] = _to_policy_result(run.policy, capacity, warmup_requests, point[run.id])
     ceiling_capacity = max(1, int(payload.get("uniqueBlocks", 0)))
     ceiling = _to_policy_result("ceiling", ceiling_capacity, warmup_requests, payload["ceiling"])
     return CppSweepResult(

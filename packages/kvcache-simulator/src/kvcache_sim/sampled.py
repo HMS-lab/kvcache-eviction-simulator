@@ -1,6 +1,7 @@
 """Recorded-time replay, isolated from the legacy policy implementations."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 import heapq
 import random
 from dataclasses import dataclass
@@ -8,6 +9,40 @@ from dataclasses import dataclass
 from .trace import seconds_us
 
 SAMPLING_POLICIES = ("sampling-lru-touch-on-put", "sampling-lru-touch-on-get")
+
+
+@dataclass(frozen=True)
+class SimulationRun:
+    id: str
+    policy: str
+    sampleSize: int | None = None
+
+    def to_json(self):
+        return {"id": self.id, "policy": self.policy, **({"sampleSize": self.sampleSize} if self.sampleSize is not None else {})}
+
+
+def normalize_sample_sizes(value: int | Sequence[int]) -> list[int]:
+    values = [value] if isinstance(value, int) else value
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence) or not values:
+        raise ValueError("Sample sizes must be a nonempty sequence of positive uint32 integers")
+    result = []
+    for size in values:
+        if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 2**32 - 1:
+            raise ValueError("Sample sizes must be positive uint32 integers")
+        if size not in result:
+            result.append(size)
+    return result
+
+
+def build_runs(policies: Sequence[str], sizes: Sequence[int]) -> list[SimulationRun]:
+    return [
+        SimulationRun(
+            f"{policy}:sample-size={size}" if size is not None and len(sizes) > 1 else policy,
+            policy, size,
+        )
+        for policy in policies
+        for size in (sizes if policy in SAMPLING_POLICIES else [None])
+    ]
 
 
 def validate_parameters(threshold: float, sample_size: int, seed: int, max_evictions: int | None = None) -> int:

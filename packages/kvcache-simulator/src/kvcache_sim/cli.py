@@ -31,6 +31,14 @@ def _parse_hyper_clock_max_score(value: str) -> int:
         raise argparse.ArgumentTypeError(str(error)) from error
 
 
+def _parse_sample_sizes(value):
+    from .sampled import normalize_sample_sizes
+    try:
+        return normalize_sample_sizes([int(part.strip()) for part in value.split(",")])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kvcache-simulator", description="Analyze KV cache hit rate for JSONL traces.")
     subparsers = parser.add_subparsers(dest="command")
@@ -49,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--scheduler", required=True, choices=["recorded", "sequential"], help="Request scheduler for all policies and the ceiling; recorded requires trace timing")
         command.add_argument("--hyper-clock-max-score", type=_parse_hyper_clock_max_score, default=3, help="Hyper Clock maximum score, a positive integer (default: 3)")
         command.add_argument("--sampled-lru-threshold-seconds", type=float, default=10.0, help="Shared Sampling LRU age threshold in seconds (default: 10)")
-        command.add_argument("--sampled-lru-sample-size", type=int, default=16, help="Number of sampled slots (default: 16)")
+        command.add_argument("--sampled-lru-sample-size", type=_parse_sample_sizes, default=[16], help="Comma-separated sample sizes, one simulation per size (default: 16)")
         command.add_argument("--sampled-lru-max-evictions", type=int, default=None, help="Maximum oldest qualifying sampled blocks to evict per eviction (positive integer; default: all qualifying blocks)")
         command.add_argument("--sampled-lru-seed", type=int, default=0, help="Shared Sampling LRU random seed (default: 0)")
         command.add_argument("--backend", choices=["cpp", "python"], default="cpp", help="Simulation backend (default: cpp)")

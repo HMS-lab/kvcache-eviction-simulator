@@ -21,6 +21,7 @@ def format_number(value: float) -> str:
 def render_table(result: dict[str, Any], *, show_speedups: bool = False) -> str:
     meta = result["metadata"]
     policies = result.get("policies") or ["fifo", "lru", "optimal"]
+    runs = result.get("runs") or [{"id": p, "policy": p} for p in policies]
     lines = [
         f"Model: {meta['modelLabel']} ({meta['modelId']})",
         f"KV precision: {meta['precisionLabel']}" + (f", Indexer: {meta['indexerPrecisionLabel']}" if meta.get("indexerPrecisionLabel") else ""),
@@ -42,7 +43,7 @@ def render_table(result: dict[str, Any], *, show_speedups: bool = False) -> str:
         params = meta["sampledLruParameters"]
         eviction_limit = params.get("maxEvictions")
         eviction_limit = "all" if eviction_limit is None else eviction_limit
-        lines.insert(-1, f"Sampling LRU: threshold {params['thresholdSeconds']}s, sample {params['sampleSize']}, seed {params['seed']}, max evictions {eviction_limit}")
+        lines.insert(-1, f"Sampling LRU: threshold {params['thresholdSeconds']}s, sample {','.join(map(str, params.get('sampleSizes', [params.get('sampleSize', 16)])))}, seed {params['seed']}, max evictions {eviction_limit}")
     for policy, reason in meta.get("skippedPolicies", {}).items():
         lines.insert(-1, f"Skipped {policy}: {reason}")
     headers = ["Budget", "Cache blocks"]
@@ -53,20 +54,28 @@ def render_table(result: dict[str, Any], *, show_speedups: bool = False) -> str:
         "sampling-lru-touch-on-put": "Sampling LRU (touch on put)",
         "sampling-lru-touch-on-get": "Sampling LRU (touch on get)",
     }
-    for policy in policies:
-        headers.append(f"{labels.get(policy, policy.upper())} hit")
+    def heading(run, metric):
+        policy = run["policy"]
+        label = f"{labels.get(policy, policy.upper())} {metric}"
+        if policy.startswith("sampling-lru-"):
+            params = meta["sampledLruParameters"]
+            size = run.get("sampleSize", params.get("sampleSize", 16))
+            limit = params.get("maxEvictions")
+            label += f" ({'all' if limit is None else limit} out {size})"
+        return label
+
+    headers.extend(heading(run, "hit") for run in runs)
     if show_speedups:
-        for policy in policies:
-            headers.append(f"{labels.get(policy, policy.upper())} speedup")
+        headers.extend(heading(run, "speedup") for run in runs)
     rows: list[list[str]] = []
     for point in result.get("points", []):
         row = [f"{format_number(point['gib'])} GiB", format_number(point["cacheBlocks"])]
-        for policy in policies:
-            result = point["results"][policy]
+        for run in runs:
+            result = point["results"][run["id"]]
             row.append("N/A" if result["measurementMode"] == "underfilled_at_window" else format_percent(result["hitRate"]))
         if show_speedups:
-            for policy in policies:
-                result = point["results"][policy]
+            for run in runs:
+                result = point["results"][run["id"]]
                 row.append("N/A" if result["measurementMode"] == "underfilled_at_window" else format_speedup(result["idealPrefillSpeedup"]))
         rows.append(row)
     if not rows:

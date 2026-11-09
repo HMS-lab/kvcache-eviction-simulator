@@ -54,6 +54,46 @@ Each variant and cache capacity starts with a new generator that uses the config
 Repeated runs in the same backend and runtime produce the same results.
 Python and C++ need not produce identical samples, evictions, or hit rates.
 
+## Compare sample sizes
+
+```bash
+kvcache-simulator run --scheduler recorded --trace converted.jsonl --model glm-5.2 \
+  --policies sampling-lru-touch-on-put,sampling-lru-touch-on-get \
+  --sampled-lru-sample-size 16,32,128 --sampled-lru-max-evictions 2
+```
+
+This command runs six simulations for each cache capacity.
+Each run has its own cache and random generator. Each generator starts with the configured seed.
+Changing the order of sample sizes does not change a run's results.
+The simulator constructs the scheduler once and resets it between runs.
+Additional sample sizes increase runtime. The simulator keeps only one simulation cache at a time.
+
+Sample sizes must be positive 32-bit integers. Empty list elements are invalid.
+Duplicate sizes appear once, in the order first specified.
+The maximum evictions option accepts one integer and applies to every sampling run.
+
+A header such as `Sampling LRU (touch on get) hit (2 out 128)` shows the configured limit and requested sample size.
+With no limit, the header shows `all out 128`.
+The effective sample size is the smaller of the requested size and the cache capacity.
+Distinct requested sizes keep separate columns, even when their effective sizes match.
+
+JSON uses an ordered `runs` array to describe each configuration.
+With multiple sizes, result keys include the size, such as `sampling-lru-touch-on-get:sample-size=128`.
+Single-size runs keep their existing keys.
+Each sampling result contains `sampleSize` and `effectiveSampleSize`.
+Shared parameters contain `sampleSizes`. For one size, they also retain the scalar `sampleSize` field.
+
+C++ tests check standalone results against combined runs and verify capacity capping:
+[`SampleSizeTests.test_native_isolation_and_cap`](../tests/test_sample_sizes.py).
+Report and CLI checks use
+[`SampleSizeTests.test_report_and_cli`](../tests/test_sample_sizes.py).
+
+For a cache of five entries, insert a sixth entry with threshold zero and no eviction limit.
+Sample sizes 1, 4, 5, and 16 leave 5, 2, 1, and 1 entries, respectively.
+With an eviction limit of 2, they leave 5, 4, 4, and 4 entries.
+These values are checked by
+[`SampleSizeTests.test_native_eviction_counts`](../tests/test_sample_sizes.py).
+
 ## Trace timing
 
 Timing fields contain numeric seconds. The simulator converts these values to
@@ -202,7 +242,8 @@ order. Requests larger than the cache write one block at a time.
 Warmup and measurement use request counts. Each Sampling LRU variant must fill the cache
 before the first measured arrival. Mixed sweeps show unavailable results as
 `N/A`. These results do not suppress budget points for the existing policies.
-Sweeps that select only one Sampling LRU variant omit underfilled budgets.
+Sweeps with exactly one Sampling LRU run omit underfilled budgets.
+With multiple runs, an underfilled sampling result shows `N/A` without removing other runs.
 
 Metadata includes the selected scheduler, replay modes, and policy parameters.
 The ceiling uses the selected scheduler.

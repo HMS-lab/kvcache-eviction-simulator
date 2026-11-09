@@ -368,4 +368,29 @@ Both variants use the same `--sampled-lru-*` configuration flags.
 
 The variants use the same eviction rules. Existing policies keep their behavior.
 
+Compare sample sizes with one command:
+
+```bash
+kvcache-simulator run --scheduler recorded --trace converted.jsonl --model glm-5.2 \
+  --sampled-lru-sample-size 16,32,128 --sampled-lru-max-evictions 2
+```
+
+Each selected Sampling LRU variant runs once per sample size and cache capacity.
+Other policies run once per capacity.
+Each run starts with an empty cache and a new random generator with the configured seed.
+The simulator shares the trace and scheduler between runs. It executes runs sequentially.
+More sample sizes increase simulation time without keeping multiple caches in memory.
+
+A column such as `Sampling LRU (touch on put) hit (2 out 32)` uses the requested sample size.
+The actual sample contains at most the cache capacity.
+An omitted eviction limit produces `all out 32`.
+The eviction limit accepts one integer. Sample sizes accept a comma-separated list.
+Duplicate sizes appear once, in the order first specified. The default sample size remains 16.
+
+JSON keeps canonical policy names in `policies` and lists configured runs in `runs`.
+Multiple sizes use result keys such as `sampling-lru-touch-on-put:sample-size=32`.
+Single-size runs keep their existing result keys.
+Sampling results include `sampleSize` and `effectiveSampleSize`.
+Shared metadata includes `sampleSizes`, plus the existing `sampleSize` field for a single size.
+
 See [Sampling LRU documentation](docs/SAMPLED_LRU.md) for configuration, timing, and eviction behavior.
