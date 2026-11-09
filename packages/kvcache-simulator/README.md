@@ -210,7 +210,7 @@ Python API calls to `run_sweep()` and `run_cpp_sweep()` also require `scheduler=
 | `--hyper-clock-max-score N` | Hyper Clock score limit; default `3`. Must be an integer in `1..2^64-1`. |
 | `--sampled-lru-max-evictions k` | Evict at most `k` oldest qualifying sampled blocks; default evicts all qualifying sampled blocks. |
 | `--backend cpp\|python` | Default is `cpp`. Python supports sequential replay for the six policies outside the Sampling LRU family. |
-| `--jobs N` | Number of worker processes for the Python backend. The C++ backend runs one batch process and ignores this option. |
+| `--jobs N` | Worker count, default `16`. The C++ backend uses threads in one process. The Python backend uses processes. |
 | `--no-progress` | Disable terminal progress output. Progress is written to stderr only when stderr is interactive, so JSON stdout stays valid. |
 | `--format table\|json` | Output format. Default is `table`. |
 | `--show-speedups` | Show theoretical prefill speedup columns in table output. Disabled by default; these are bounds, not measured latency or throughput. JSON results always include speedup values. |
@@ -335,7 +335,7 @@ For an end-to-end example, use capacity `3`, maximum score `3`, and these four o
 ## Performance Notes
 
 The CLI displays an overall progress bar and one row per worker on interactive stderr.
-Each row identifies the current job. C++ execution remains sequential, so the display currently shows worker 0 only.
+Each row identifies the current job. C++ workers share one trace and schedule. Each simulation has a separate cache and cursor.
 Progress updates are best effort. Use `--no-progress` to disable the display.
 
 The C++ backend loads the trace and builds the prefix trie once.
@@ -345,7 +345,12 @@ After writing the binary trace files, the CLI releases Python's block ID, token 
 
 Python API calls to `run_sweep()` and `run_cpp_sweep()` preserve the input trace by default. With the C++ backend, pass `release_trace_data=True` to release those lists after writing; the consumed trace cannot be reused for another simulation. The Python backend retains its lists for replay.
 
-`--jobs` applies only to the Python backend. It parallelizes independent `(policy, cache budget)` simulation tasks. More jobs are not always faster: the default budget sweep has only a small number of budget points, tasks have uneven runtimes, and large traces can become memory-bandwidth limited.
+`--jobs N` selects the worker count. The CLI default is `16`. Use `--jobs 1` for sequential execution.
+The C++ backend calculates the ceiling first. It then assigns jobs to threads, with larger cache capacities first.
+The worker count cannot exceed the number of pending jobs. Reports keep their existing budget order.
+Each active simulation needs its own cache memory. More workers increase peak memory use.
+A worker exception terminates the C++ process. The error identifies the worker, job, and exception cause.
+The Python backend uses worker processes for independent simulation tasks.
 
 ## Limits
 
@@ -384,8 +389,9 @@ kvcache-simulator run --scheduler recorded --trace converted.jsonl --model glm-5
 Each selected Sampling LRU variant runs once per sample size and cache capacity.
 Other policies run once per capacity.
 Each run starts with an empty cache and a new random generator with the configured seed.
-The simulator shares the trace and scheduler between runs. It executes runs sequentially.
-More sample sizes increase simulation time without keeping multiple caches in memory.
+The simulator shares the read-only trace and scheduler between runs.
+Up to `--jobs` runs execute concurrently, each with its own cache.
+More sample sizes increase the number of jobs. The worker count limits the number of active caches.
 
 A column such as `Sampling LRU (touch on put) hit (2 out 32)` uses the requested sample size.
 The actual sample contains at most the cache capacity.

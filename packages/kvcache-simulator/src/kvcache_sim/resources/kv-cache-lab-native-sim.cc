@@ -15,6 +15,7 @@
 #include <queue>
 #include <random>
 #include <tuple>
+#include <thread>
 #include <iterator>
 #include <sstream>
 #include <stdexcept>
@@ -43,6 +44,7 @@ struct Options {
   std::uint64_t request_count = 0;
   std::uint64_t warmup_requests = 0;
   std::uint32_t capacity = 0;
+  std::uint32_t jobs = 1;
   std::uint64_t hyper_clock_max_score = 3;
   std::vector<std::uint32_t> capacities;
   std::vector<std::string> policies;
@@ -133,6 +135,11 @@ Options parse_args(int argc, char** argv) {
       return argv[++index];
     };
     if (arg == "--policy") options.policy = require_value(arg);
+    else if (arg == "--jobs") {
+      const auto n = parse_sampled_u64(require_value(arg), arg);
+      if (!n || n > 0xffffffffULL) throw std::runtime_error("--jobs must be in 1..2^32-1");
+      options.jobs = static_cast<std::uint32_t>(n);
+    }
     else if (arg == "--scheduler") options.scheduler = require_value(arg);
     else if (arg == "--ids") options.ids_path = require_value(arg);
     else if (arg == "--tokens") options.tokens_path = require_value(arg);
@@ -1361,7 +1368,7 @@ struct SimulationJob {
 };
 
 // All jobs are known before execution. Only the next-job index changes.
-// The main thread currently consumes the entire queue.
+// Consumers claim jobs independently through the atomic index.
 class SimulationJobQueue {
  public:
   explicit SimulationJobQueue(std::vector<SimulationJob> jobs)
@@ -1392,6 +1399,14 @@ class SimulationJobQueue {
   std::vector<std::size_t> order_;
   std::atomic<std::size_t> next_{0};
 };
+
+[[noreturn]] void fail_worker(std::size_t worker, const SimulationJob* job, const char* cause) {
+  std::lock_guard<std::mutex> lock(progress_output_mutex);
+  std::cerr << "Worker " << worker << " failed";
+  if (job) std::cerr << " in job " << job->result_index << " (" << job->label << ")";
+  std::cerr << ": " << cause << std::endl;
+  std::_Exit(EXIT_FAILURE);
+}
 
 class SimulationRunner {
  public:
@@ -1453,23 +1468,50 @@ class SimulationRunner {
     const std::uint64_t total_steps = queue.size();
     ProgressState progress_state;
 
-    while (const auto* job = queue.take()) {
-      Options configured = options;
-      configured.sampled_size = job->sample_size;
-      configured.progress_done = progress_state.completed.load(std::memory_order_relaxed);
-      configured.progress_state = &progress_state;
-      configured.progress_worker = 0;
-      configured.progress_job = job->result_index;
-      configured.progress_total = total_steps;
-      configured.progress_label = job->label;
-      report_progress(configured, 0, total_steps, job->label);
-      const bool sampling = job->policy.find("sampling-lru-") == 0;
-      results[job->result_index] = sampling
-          ? simulate_sampled(input, job->capacity, configured, job->policy == "sampling-lru-touch-on-put")
-          : run(job->policy, job->capacity);
-      progress_state.completed.fetch_add(1, std::memory_order_relaxed);
-      if (job->capacity_index != 0)
+    auto execute = [&](const SimulationJob* job, std::size_t worker) {
+      try {
+        Options configured = options;
+        configured.sampled_size = job->sample_size;
+        configured.progress_done = progress_state.completed.load(std::memory_order_relaxed);
+        configured.progress_state = &progress_state;
+        configured.progress_worker = worker;
+        configured.progress_job = job->result_index;
+        configured.progress_total = total_steps;
+        configured.progress_label = job->label;
         report_progress(configured, 0, total_steps, job->label);
+        const bool sampling = job->policy.find("sampling-lru-") == 0;
+        results[job->result_index] = sampling
+            ? simulate_sampled(input, job->capacity, configured, job->policy == "sampling-lru-touch-on-put")
+            : run(job->policy, job->capacity);
+        progress_state.completed.fetch_add(1, std::memory_order_relaxed);
+        if (job->capacity_index != 0)
+          report_progress(configured, 0, total_steps, job->label);
+      } catch (const std::exception& error) {
+        fail_worker(worker, job, error.what());
+      } catch (...) {
+        fail_worker(worker, job, "unknown exception");
+      }
+    };
+
+    // Complete the ceiling before workers start claiming capacity simulations.
+    execute(queue.take(), 0);
+    const auto worker_count = std::min<std::size_t>(options.jobs, queue.pending());
+    auto consume = [&](std::size_t worker) {
+      while (const auto* job = queue.take()) execute(job, worker);
+    };
+    if (worker_count == 1) {
+      consume(0);
+    } else {
+      std::vector<std::thread> workers;
+      workers.reserve(worker_count);
+      for (std::size_t worker = 0; worker < worker_count; ++worker) {
+        try {
+          workers.emplace_back(consume, worker);
+        } catch (const std::exception& error) {
+          fail_worker(worker, nullptr, error.what());
+        }
+      }
+      for (auto& worker : workers) worker.join();
     }
 
     std::cout << "{"

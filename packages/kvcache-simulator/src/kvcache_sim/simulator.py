@@ -182,6 +182,7 @@ def run_sweep(
             policies=selected_policies,
             warmup_requests=warmup_requests,
             scheduler=scheduler,
+            jobs=jobs,
             hyper_clock_max_score=hyper_clock_max_score,
             **sampled,
             release_trace_data=release_trace_data,

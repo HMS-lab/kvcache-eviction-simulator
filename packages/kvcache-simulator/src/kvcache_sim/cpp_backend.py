@@ -60,7 +60,7 @@ def ensure_cpp_simulator(progress: ProgressCallback | None = None) -> Path:
         raise RuntimeError("C++ simulator backend requires a C++ compiler. Install c++/clang++ or run with --backend python.")
     if progress:
         progress(0, 1, "compiling C++ simulator")
-    subprocess.run([compiler, "-std=c++17", "-O3", str(source), "-o", str(output)], check=True, capture_output=True, text=True)
+    subprocess.run([compiler, "-std=c++17", "-O3", "-pthread", str(source), "-o", str(output)], check=True, capture_output=True, text=True)
     return output
 
 
@@ -159,6 +159,7 @@ def run_cpp_sweep(
     policies: list[str],
     warmup_requests: int,
     scheduler: str,
+    jobs: int = 1,
     hyper_clock_max_score: int = 3,
     sampled_lru_threshold_seconds: float = 10.0,
     sampled_lru_sample_size: int | Sequence[int] = 16,
@@ -169,6 +170,8 @@ def run_cpp_sweep(
     worker_progress: WorkerProgressCallback | None = None,
 ) -> CppSweepResult:
     """Run native replay; optionally consume the trace's event lists after writing."""
+    if isinstance(jobs, bool) or not isinstance(jobs, int) or not 1 <= jobs <= UINT32_MAX:
+        raise ValueError("jobs must be an integer in 1..2^32-1")
     validate_hyper_clock_max_score(hyper_clock_max_score)
     sample_sizes = normalize_sample_sizes(sampled_lru_sample_size)
     if scheduler not in {"recorded", "sequential"}:
@@ -235,6 +238,7 @@ def run_cpp_sweep(
                             "--sampled-lru-seed", str(sampled_lru_seed)))
         if any(p in SAMPLING_POLICIES for p in policies) and sampled_lru_max_evictions is not None:
             command.extend(("--sampled-lru-max-evictions", str(sampled_lru_max_evictions)))
+        command.extend(("--jobs", str(jobs)))
         if progress or worker_progress:
             command.append("--progress")
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

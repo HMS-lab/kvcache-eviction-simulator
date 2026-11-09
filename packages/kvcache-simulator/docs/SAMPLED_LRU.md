@@ -66,7 +66,7 @@ This command runs six simulations for each cache capacity.
 Each run has its own cache and random generator. Each generator starts with the configured seed.
 Changing the order of sample sizes does not change a run's results.
 The simulator constructs the scheduler once and resets it between runs.
-Additional sample sizes increase runtime. The simulator keeps only one simulation cache at a time.
+Additional sample sizes increase the number of jobs. Each active job has a separate simulation cache.
 
 Sample sizes must be positive 32-bit integers. Empty list elements are invalid.
 Duplicate sizes appear once, in the order first specified.
@@ -110,7 +110,8 @@ An underfilled cache reports its percentage at the stopping point. It does not c
 A zero-capacity run reports that it skips cache simulation.
 
 The CLI displays an overall bar and one fixed row per worker on interactive stderr.
-The C++ backend still executes jobs sequentially, so it currently reports worker 0 only.
+The CLI starts up to `--jobs` C++ worker threads. The default is `16`.
+Use `--jobs 1` for sequential execution.
 Each message identifies the worker and job. A new job replaces the previous job in that worker's row.
 Python reads both subprocess pipes in background threads. The calling thread invokes progress callbacks and renders the rows.
 The display refreshes at most five times per second, except for new rows and final updates.
@@ -227,7 +228,7 @@ The shared scheduler provides these methods:
 Each simulation constructs a separate `SchedulerCursor`.
 The cursor references the shared scheduler and stores its own position.
 A thread-local pointer identifies the active cursor.
-This change does not add threads. Simulations still execute sequentially.
+C++ worker threads share the read-only scheduler. Each active simulation has a separate cursor.
 
 The cursor provides these methods:
 

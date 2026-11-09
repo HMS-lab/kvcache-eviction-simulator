@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--sampled-lru-max-evictions", type=int, default=None, help="Maximum oldest qualifying sampled blocks to evict per eviction (positive integer; default: all qualifying blocks)")
         command.add_argument("--sampled-lru-seed", type=int, default=0, help="Shared Sampling LRU random seed (default: 0)")
         command.add_argument("--backend", choices=["cpp", "python"], default="cpp", help="Simulation backend (default: cpp)")
-        command.add_argument("--jobs", type=int, default=1, help="Worker processes for the Python backend; ignored by the C++ backend")
+        command.add_argument("--jobs", type=int, default=16, help="Worker count (default: 16). C++ uses threads; Python uses processes.")
         command.add_argument("--no-progress", action="store_true", help="Disable terminal progress output")
         command.add_argument("--format", choices=["table", "json"], default="table", help="Output format (default: table)")
         command.add_argument("--show-speedups", action="store_true", help="Show theoretical prefill speedup columns in table output (not measured latency or throughput; disabled by default)")
