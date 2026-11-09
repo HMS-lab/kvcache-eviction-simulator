@@ -268,16 +268,22 @@ number of resident entries. It evicts **all** sampled entries strictly older tha
 the threshold by default. Set `--sampled-lru-max-evictions k` (or
 `sampled_lru_max_evictions=k` in the sweep/policy APIs) to evict at most `k`
 qualifying sampled blocks, starting with the oldest. The limit must be a positive
-32-bit integer. A limit of 1 evicts only the oldest qualifying sampled block;
-a limit larger than the sample size can evict the entire qualifying sample.
+32-bit integer. A limit of 1 evicts only the oldest qualifying sampled block.
+A limit larger than the sample size can evict the entire qualifying sample.
 Ties in access time use access sequence, oldest first. Blocks whose age equals
 the positive threshold do not qualify. Later writes use the extra free slots
 without further sampling.
 
+The C++ policy builds a min-heap of sampled slot indices instead of sorting sampled entries.
+It removes the oldest eligible entry from the heap until it reaches the eviction limit or finds no eligible entry.
+The first eviction reserves enough heap storage for every cache slot.
+The policy reuses this single allocation for sampling, fallback, and later evictions.
+A simulation that never evicts does not allocate heap storage.
+
 If no sampled entry qualifies, the policy uses this fallback:
 
-1. Scan all slots once. Collect resident slot indices.
-2. Build a min-heap from these indices. The oldest entry is at the top.
+1. Scan all slots once. Append unsampled resident slot indices to the existing heap buffer.
+2. Rebuild the min-heap in the same buffer. The oldest entry is at the top.
 3. Check the oldest entry against the configured threshold.
 4. If it does not qualify, halve a local copy of the threshold. Repeat the check without another scan.
 5. Evict eligible entries from the heap, oldest first, up to `--sampled-lru-max-evictions`.
@@ -286,7 +292,7 @@ Without an eviction limit, the fallback evicts all entries eligible at the selec
 The fallback stops before an entry that does not qualify. Equal timestamps use access sequence, oldest first.
 The successful-sample path keeps its existing behavior.
 
-For `N` resident entries and `K` victims, the fallback uses `O(N + K log N)` work and `O(N)` temporary storage.
+For `N` resident entries and `K` victims, the fallback uses `O(N + K log N)` work and `O(N)` reusable heap storage.
 Threshold halving adds at most 64 checks of the oldest entry for a 64-bit threshold.
 It does not repeat the full scan.
 
@@ -332,6 +338,9 @@ Metadata includes the selected scheduler, replay modes, and policy parameters.
 The ceiling uses the selected scheduler.
 `idealPrefillSpeedup` is a bound derived from the hit rate.
 It does not measure latency or throughput.
+
+The heap storage test uses the C++ backend:
+[`NativeHeapFallbackTests.test_one_heap_buffer_reused_for_sampling_fallback_and_later_evictions`](../tests/test_sampled_lru_fallback.py).
 
 ## Model limits and memory
 

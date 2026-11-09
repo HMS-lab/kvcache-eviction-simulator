@@ -71,10 +71,10 @@ void halving() {
   auto o = options(2); o.sampled_max_evictions = 1;
   SampledCache c(2,o,16); c.write(1,8*S); c.write(2,8*S);
   eligibility_ages.clear(); c.write(3,10*S);
-  assert((eligibility_ages == std::vector<std::uint64_t>{10*S,10*S,10*S,5*S,2500000,1250000,1250000}));
+  assert((eligibility_ages == std::vector<std::uint64_t>{10*S,10*S,5*S,2500000,1250000,1250000}));
   assert((state(c) == State{{3,10*S},{2,8*S}}));
   eligibility_ages.clear(); c.write(4,10*S);
-  assert((eligibility_ages == std::vector<std::uint64_t>{10*S,10*S,10*S,5*S,2500000,1250000,1250000}));
+  assert((eligibility_ages == std::vector<std::uint64_t>{10*S,10*S,5*S,2500000,1250000,1250000}));
   assert((state(c) == State{{3,10*S},{4,10*S}}));
   eligibility_ages.clear(); c.write(5,10*S);
   assert(eligibility_ages.back() == 0);
@@ -145,12 +145,13 @@ class NativeDocumentedExamplesTests(unittest.TestCase):
         }
         if (!writing) reads.emplace_back(node,now,true);""", 1)
         cache = cache.replace("return slot.node != 0 &&", "eligibility_ages.push_back(age);\n    return slot.node != 0 &&", 1)
-        cache = cache.replace("    std::sort(sample.begin()", """
+        cache = cache.replace("    std::make_heap(candidates.begin()", """
     if (!forced_sample.empty()) {
-      sample.clear(); for (auto index : forced_sample) sample.push_back(slots.at(index));
+      candidates.clear(); selected.clear();
+      for (auto index : forced_sample) { candidates.push_back(index); selected.insert(index); }
       forced_sample.clear();
     }
-    std::sort(sample.begin()""", 1)
+    std::make_heap(candidates.begin()""", 1)
         cache = cache.replace("void write(std::uint32_t node, std::uint64_t now) {", """void write(std::uint32_t node, std::uint64_t now) {
     struct Capture {
       SampledCache& cache; unsigned node; std::uint64_t now;

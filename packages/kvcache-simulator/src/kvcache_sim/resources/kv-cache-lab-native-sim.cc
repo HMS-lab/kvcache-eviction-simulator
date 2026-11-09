@@ -1130,6 +1130,7 @@ struct SampledCache {
   std::mt19937_64 rng;
   std::vector<SampledSlot> slots;
   std::vector<std::size_t> free;
+  std::vector<std::size_t> candidates;  // Reuse one allocation for sample and fallback heaps.
   static constexpr std::uint32_t absent = 0xffffffffU;
   std::vector<std::uint32_t> node_to_slot;
   SampledCounters counters;
@@ -1152,43 +1153,44 @@ struct SampledCache {
   }
   void evict(std::uint64_t now) {
     ++counters.attempts;
-    std::vector<SampledSlot> sample;
+    // Eviction starts only when all slots are occupied. Reserve enough for the
+    // full fallback on the first eviction; later evictions reuse this storage.
+    candidates.clear();
+    candidates.reserve(slots.size());
     const auto count = std::min<std::size_t>(sample_size, slots.size());
-    sample.reserve(count);
     std::unordered_set<std::size_t> selected;
     selected.reserve(count);
     std::uniform_int_distribution<std::size_t> draw(0, slots.size() - 1);
-    while (sample.size() < count) {
+    while (candidates.size() < count) {
       const auto index = draw(rng);
-      if (selected.insert(index).second) sample.push_back(slots[index]);
-      if (progress) progress->tick();
-    }
-    std::sort(sample.begin(), sample.end(), [](const auto& a, const auto& b) {
-      return std::tie(a.timestamp, a.sequence) < std::tie(b.timestamp, b.sequence);
-    });
-    std::uint32_t evicted = 0;
-    for (const auto& slot : sample) {
-      if (progress) progress->tick();
-      if (eligible(slot, now, threshold)) {
-        discard(node_to_slot[slot.node]);
-        ++counters.sampled_evictions;
-        if (++evicted == max_evictions) break;
-      }
-    }
-    if (!free.empty()) return;
-    ++counters.fallbacks;
-    // Build once. Threshold halving checks only the oldest resident entry.
-    std::vector<std::size_t> candidates;
-    candidates.reserve(slots.size());
-    for (std::size_t i = 0; i < slots.size(); ++i) {
-      if (slots[i].node != 0) candidates.push_back(i);
-      ++counters.inspected;
+      if (selected.insert(index).second) candidates.push_back(index);
       if (progress) progress->tick();
     }
     const auto newer = [&](std::size_t a, std::size_t b) {
       return std::tie(slots[a].timestamp, slots[a].sequence) >
              std::tie(slots[b].timestamp, slots[b].sequence);
     };
+    std::make_heap(candidates.begin(), candidates.end(), newer);
+    std::uint32_t evicted = 0;
+    while (!candidates.empty() && evicted < max_evictions &&
+           eligible(slots[candidates.front()], now, threshold)) {
+      std::pop_heap(candidates.begin(), candidates.end(), newer);
+      const auto index = candidates.back();
+      candidates.pop_back();
+      discard(index);
+      ++counters.sampled_evictions;
+      ++evicted;
+      if (progress) progress->tick();
+    }
+    if (!free.empty()) return;
+    ++counters.fallbacks;
+    // No sampled entries were evicted. Extend the existing buffer with the
+    // unsampled slots, then rebuild the heap without another allocation.
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+      if (slots[i].node != 0 && selected.find(i) == selected.end()) candidates.push_back(i);
+      ++counters.inspected;
+      if (progress) progress->tick();
+    }
     std::make_heap(candidates.begin(), candidates.end(), newer);
     assert(!candidates.empty());
     auto age = threshold;
