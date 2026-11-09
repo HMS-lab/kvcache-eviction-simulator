@@ -194,6 +194,44 @@ void job_queue() {
   // Taking later jobs never invalidates earlier descriptors.
   assert(ceiling == &queue.jobs()[0] && ceiling->policy == "ceiling");
 }
+void concurrent_reporting() {
+  std::ostringstream output;
+  auto* previous = std::cerr.rdbuf(output.rdbuf());
+  Options options; options.progress = true;
+  {
+    std::lock_guard<std::mutex> lock(progress_output_mutex);
+    std::thread attempt([&] { report_progress(options, 0, 1, "dropped", true); });
+    attempt.join(); // Best-effort reporting must not wait for this lock.
+    assert(output.str().empty());
+  }
+  std::vector<SimulationJob> jobs;
+  for (unsigned n = 0; n < 1000; ++n)
+    jobs.push_back({n, "fifo", "fifo", 1, 1, 0, "job " + std::to_string(n)});
+  SimulationJobQueue queue(std::move(jobs));
+  std::vector<std::atomic<unsigned>> seen(queue.size());
+  for (auto& count : seen) count.store(0);
+  ProgressState state;
+  std::vector<std::thread> threads;
+  for (unsigned worker = 0; worker < 4; ++worker) {
+    threads.emplace_back([&, worker] {
+      Options local = options;
+      local.progress_worker = worker;
+      local.progress_state = &state;
+      while (const auto* job = queue.take()) {
+        seen[job->result_index].fetch_add(1);
+        state.completed.fetch_add(1, std::memory_order_relaxed);
+        local.progress_job = job->result_index;
+        report_progress(local, 0, queue.size(), job->label, true);
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  for (const auto& count : seen) assert(count.load() == 1);
+  assert(queue.pending() == 0 && state.completed.load() == queue.size());
+  report_progress(options, queue.size(), queue.size(), "simulation complete");
+  std::cerr.rdbuf(previous);
+  std::cout << output.str();
+}
 void singleton_guard(const std::string& mode) {
   if (mode == "uninitialized") { RequestScheduler::get(); return; }
   AlternateScheduler schedule;
@@ -214,6 +252,7 @@ int main(int argc, char** argv) {
   else if (mode == "lifecycle") lifecycle();
   else if (mode == "alternate") alternate();
   else if (mode == "job-queue") job_queue();
+  else if (mode == "concurrent-reporting") concurrent_reporting();
   else if (mode == "uninitialized" || mode == "duplicate" || mode == "partial"
            || mode == "consumed" || mode == "missing-cursor" || mode == "duplicate-cursor") singleton_guard(mode);
   else {
@@ -244,8 +283,8 @@ class NativeRequestSchedulerTests(unittest.TestCase):
                                 'event_count_(2ULL * request_count) { ++sequential_constructions; }', 1)
         cpp = Path(cls.directory.name) / 'scheduler.cc'
         cls.binary = Path(cls.directory.name) / 'scheduler'
-        cpp.write_text('#define main simulator_main\n' + source + '\n#undef main\n' + HARNESS)
-        compiled = subprocess.run(['c++', '-std=c++17', '-O0', str(cpp), '-o', str(cls.binary)],
+        cpp.write_text('#include <thread>\n#define main simulator_main\n' + source + '\n#undef main\n' + HARNESS)
+        compiled = subprocess.run(['c++', '-std=c++17', '-pthread', '-O0', str(cpp), '-o', str(cls.binary)],
                                   capture_output=True, text=True)
         if compiled.returncode:
             raise AssertionError(compiled.stderr)
@@ -275,6 +314,21 @@ class NativeRequestSchedulerTests(unittest.TestCase):
 
     def test_job_queue_expansion_order_and_pending_count(self):
         subprocess.run([str(self.binary), 'job-queue'], check=True, capture_output=True)
+
+    def test_concurrent_job_assignment_and_best_effort_reporting(self):
+        output = subprocess.run([str(self.binary), 'concurrent-reporting'], check=True,
+                                capture_output=True, text=True, timeout=20).stdout.splitlines()
+        counts = []
+        for line in output[:-1]:
+            tag, done, total, worker, job, label = line.split(' ', 5)
+            self.assertEqual(tag, 'KV_WORKER_PROGRESS')
+            self.assertEqual(int(total), 1000)
+            self.assertIn(int(worker), range(4))
+            self.assertEqual(label, f'job {job}')
+            counts.append(int(done))
+        self.assertTrue(counts)
+        self.assertEqual(counts, sorted(counts))
+        self.assertEqual(output[-1], 'KV_PROGRESS 1000 1000 simulation complete')
 
     def test_construct_once_and_reuse_across_capacities(self):
         trace = parse_trace_lines([json.dumps(dict(

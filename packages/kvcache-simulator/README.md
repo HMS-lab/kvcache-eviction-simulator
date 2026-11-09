@@ -334,6 +334,10 @@ For an end-to-end example, use capacity `3`, maximum score `3`, and these four o
 
 ## Performance Notes
 
+The CLI displays an overall progress bar and one row per worker on interactive stderr.
+Each row identifies the current job. C++ execution remains sequential, so the display currently shows worker 0 only.
+Progress updates are best effort. Use `--no-progress` to disable the display.
+
 The C++ backend loads the trace and builds the prefix trie once.
 It constructs the selected scheduler once and reuses it across all policies and cache capacities.
 

@@ -115,6 +115,7 @@ def run_sweep_command(args: argparse.Namespace) -> int:
             jobs=args.jobs,
             backend=args.backend,
             progress=progress.update,
+            worker_progress=progress.update_worker,
             estimate_tokens=args.estimate_tokens,
             include_draft_kv_cache=args.include_draft_kv_cache,
             models_data=data,

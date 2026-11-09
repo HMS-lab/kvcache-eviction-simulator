@@ -102,18 +102,34 @@ Each request has two events: arrival and completion. An event counts as complete
 
 Updates occur about once per second during active processing, including long requests and fallback scans.
 The simulator checks wall time every 4096 operations to limit logging overhead.
-It also reports the start and end of each run. Short runs can finish before the first periodic update.
+The simulator also attempts to report the start and end of each run.
+Short runs can finish before the first periodic update.
 
 The event percentage belongs to the current run. The bar percentage tracks completed runs across the whole simulation.
 An underfilled cache reports its percentage at the stopping point. It does not count skipped events as processed.
 A zero-capacity run reports that it skips cache simulation.
 
-The CLI displays progress on interactive stderr. Use `--no-progress` to disable it.
+The CLI displays an overall bar and one fixed row per worker on interactive stderr.
+The C++ backend still executes jobs sequentially, so it currently reports worker 0 only.
+Each message identifies the worker and job. A new job replaces the previous job in that worker's row.
+Python reads both subprocess pipes in background threads. The calling thread invokes progress callbacks and renders the rows.
+The display refreshes at most five times per second, except for new rows and final updates.
+
+C++ uses one mutex to keep each progress message intact.
+Job updates use `try_lock()` and skip the message if the mutex is busy.
+The shared completed-job count uses an atomic integer. The final overall update follows all completed jobs.
+Progress is best effort. Missing updates do not delay a simulation.
+Use `--no-progress` to disable the display.
 The progress display does not change JSON results or cache behavior.
 
 C++ tests: [test_sampled_lru_progress.py](../tests/test_sampled_lru_progress.py),
 `NativeSampledProgressTests.test_event_counts_run_identity_and_unchanged_results`,
 `test_early_exit_reports_actual_events`, and `test_throttle_counters_and_updates_inside_long_fallback`.
+
+Progress synchronization tests: [test_request_scheduler.py](../tests/test_request_scheduler.py),
+`NativeRequestSchedulerTests.test_concurrent_job_assignment_and_best_effort_reporting`.
+Display tests: [test_progress_workers.py](../tests/test_progress_workers.py),
+`WorkerProgressTests.test_worker_rows_keep_identity_throttle_and_clear_on_finish`.
 
 ## Trace timing
 

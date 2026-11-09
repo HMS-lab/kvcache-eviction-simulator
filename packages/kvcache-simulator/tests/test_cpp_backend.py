@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import weakref
@@ -76,6 +77,23 @@ class NativeTraceHandoffTests(unittest.TestCase):
                          [(done, 6) for start in range(2, 6) for done in (start, start + 1)])
         self.assertEqual(updates[-1], (6, 6, "simulation complete"))
         self.assertEqual(len(result.results), 4)
+
+    def test_progress_callbacks_execute_on_calling_thread(self):
+        owner = threading.get_ident()
+        overall_threads, worker_threads, worker_ids = [], [], []
+        def worker_progress(worker, job, label):
+            worker_threads.append(threading.get_ident())
+            worker_ids.append((worker, job))
+        run_cpp_sweep(
+            make_trace(), scheduler="sequential", capacities=[4],
+            policies=["sampling-lru-touch-on-put", "fifo"], warmup_requests=2,
+            progress=lambda *args: overall_threads.append(threading.get_ident()),
+            worker_progress=worker_progress,
+        )
+        self.assertTrue(overall_threads and worker_threads)
+        self.assertEqual(set(overall_threads + worker_threads), {owner})
+        self.assertEqual(set(worker for worker, job in worker_ids), {0})
+        self.assertEqual(set(job for worker, job in worker_ids), {0, 1, 2})
 
     def test_lists_freed_before_process_starts_and_original_count_is_passed(self):
         class TrackedList(list):

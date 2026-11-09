@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import queue
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ from .trace import TraceData
 UINT32_MAX = 2**32 - 1
 UINT16_MAX = 2**16 - 1
 ProgressCallback = Callable[[int, int, str], None]
+WorkerProgressCallback = Callable[[int, int, str], None]
 
 
 @dataclass(frozen=True)
@@ -117,22 +119,34 @@ def _to_policy_result(policy: str, capacity: int, warmup_requests: int, payload:
     )
 
 
-def _read_progress(process: subprocess.Popen[str], progress: ProgressCallback | None, total_prefix: int) -> list[str]:
+def _read_progress(
+    process: subprocess.Popen[str], progress: ProgressCallback | None, total_prefix: int,
+    worker_progress: WorkerProgressCallback | None = None,
+) -> list[str]:
     stderr_lines: list[str] = []
     if process.stderr is None:
         return stderr_lines
     for raw in process.stderr:
         line = raw.rstrip("\n")
-        if line.startswith("KV_PROGRESS "):
-            parts = line.split(" ", 3)
-            if len(parts) == 4 and progress:
-                try:
-                    done = int(parts[1])
-                    total = int(parts[2])
-                except ValueError:
-                    stderr_lines.append(line)
-                    continue
-                progress(total_prefix + done, total_prefix + total, parts[3])
+        worker_message = line.startswith("KV_WORKER_PROGRESS ")
+        if worker_message or line.startswith("KV_PROGRESS "):
+            parts = line.split(" ", 5 if worker_message else 3)
+            try:
+                if len(parts) != (6 if worker_message else 4):
+                    raise ValueError("Incomplete progress message")
+                done, total = int(parts[1]), int(parts[2])
+                if worker_message:
+                    worker, job = int(parts[3]), int(parts[4])
+                    if worker < 0 or job < 0:
+                        raise ValueError("Invalid progress identity")
+                label = parts[-1]
+            except ValueError:
+                stderr_lines.append(line)
+                continue
+            if progress:
+                progress(total_prefix + done, total_prefix + total, label)
+            if worker_message and worker_progress:
+                worker_progress(worker, job, label)
             continue
         stderr_lines.append(line)
     return stderr_lines
@@ -152,6 +166,7 @@ def run_cpp_sweep(
     sampled_lru_max_evictions: int | None = None,
     release_trace_data: bool = False,
     progress: ProgressCallback | None = None,
+    worker_progress: WorkerProgressCallback | None = None,
 ) -> CppSweepResult:
     """Run native replay; optionally consume the trace's event lists after writing."""
     validate_hyper_clock_max_score(hyper_clock_max_score)
@@ -220,15 +235,43 @@ def run_cpp_sweep(
                             "--sampled-lru-seed", str(sampled_lru_seed)))
         if any(p in SAMPLING_POLICIES for p in policies) and sampled_lru_max_evictions is not None:
             command.extend(("--sampled-lru-max-evictions", str(sampled_lru_max_evictions)))
-        if progress:
+        if progress or worker_progress:
             command.append("--progress")
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stderr_lines: list[str] = []
-        stderr_thread = threading.Thread(target=lambda: stderr_lines.extend(_read_progress(process, progress, 1)), daemon=True)
+        updates: queue.Queue[tuple[str, tuple]] = queue.Queue()
+        stdout_parts: list[str] = []
+        stderr_thread = threading.Thread(target=lambda: stderr_lines.extend(_read_progress(
+            process, lambda *args: updates.put(("overall", args)), 1,
+            lambda *args: updates.put(("worker", args)))), daemon=True)
+        # Drain both pipes while the calling thread handles terminal updates.
+        stdout_thread = threading.Thread(
+            target=lambda: stdout_parts.append(process.stdout.read() if process.stdout else ""), daemon=True)
         stderr_thread.start()
-        stdout = process.stdout.read() if process.stdout else ""
+        stdout_thread.start()
+        try:
+            while stderr_thread.is_alive() or not updates.empty():
+                try:
+                    kind, args = updates.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                callback = progress if kind == "overall" else worker_progress
+                if callback:
+                    callback(*args)
+        except BaseException:
+            process.kill()
+            process.wait()
+            stderr_thread.join()
+            stdout_thread.join()
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+            raise
         return_code = process.wait()
         stderr_thread.join()
+        stdout_thread.join()
+        stdout = "".join(stdout_parts)
         if process.stdout:
             process.stdout.close()
         if process.stderr:

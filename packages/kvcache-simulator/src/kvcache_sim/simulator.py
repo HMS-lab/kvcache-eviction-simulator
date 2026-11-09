@@ -101,6 +101,7 @@ def run_sweep(
     jobs: int = 1,
     backend: str = "cpp",
     progress: ProgressCallback | None = None,
+    worker_progress: Callable[[int, int, str], None] | None = None,
     warmup_fraction: float = 0.5,
     estimate_tokens: int | None = None,
     include_draft_kv_cache: bool = False,
@@ -184,6 +185,7 @@ def run_sweep(
             **sampled,
             release_trace_data=release_trace_data,
             progress=cpp_progress,
+            worker_progress=worker_progress,
         )
         unique_blocks = cpp_result.unique_blocks
         sim_results = cpp_result.results

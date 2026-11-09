@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <cassert>
 #include <optional>
 #include <charconv>
@@ -25,6 +27,10 @@ namespace {
 
 constexpr std::size_t kChunkEvents = 1'000'000;
 
+struct ProgressState {
+  std::atomic<std::uint64_t> completed{0};
+};
+
 struct Options {
   std::string policy;
   std::string scheduler;
@@ -43,6 +49,9 @@ struct Options {
   bool progress = false;
   std::uint64_t progress_done = 0, progress_total = 1;
   std::string progress_label;
+  ProgressState* progress_state = nullptr;
+  std::int64_t progress_worker = -1;
+  std::uint64_t progress_job = 0;
   std::string arrivals_path, completions_path, order_path;
   std::uint64_t sampled_threshold = 10000000, sampled_seed = 0;
   std::vector<std::uint32_t> sampled_sizes{16};
@@ -185,9 +194,25 @@ Options parse_args(int argc, char** argv) {
   return options;
 }
 
-void report_progress(const Options& options, std::uint64_t done, std::uint64_t total, const std::string& label) {
+std::mutex progress_output_mutex;
+
+void report_progress(const Options& options, std::uint64_t done, std::uint64_t total,
+                     const std::string& label, bool best_effort = false) {
   if (!options.progress) return;
-  std::cerr << "KV_PROGRESS " << done << " " << total << " " << label << "\n";
+  std::unique_lock<std::mutex> lock(progress_output_mutex, std::defer_lock);
+  if (best_effort) {
+    if (!lock.try_lock()) return;
+  } else {
+    lock.lock();
+  }
+  // Read after locking so concurrent messages cannot publish an older count.
+  if (options.progress_state) done = options.progress_state->completed.load(std::memory_order_relaxed);
+  if (options.progress_worker >= 0) {
+    std::cerr << "KV_WORKER_PROGRESS " << done << " " << total << " "
+              << options.progress_worker << " " << options.progress_job << " " << label << "\n";
+  } else {
+    std::cerr << "KV_PROGRESS " << done << " " << total << " " << label << "\n";
+  }
 }
 
 std::vector<std::uint32_t> load_request_ends(const Options& options) {
@@ -1078,7 +1103,7 @@ struct SampledProgress {
     const auto percent = total_events ? 100 * completed_events / total_events : 100;
     report_progress(options, options.progress_done, options.progress_total,
         label + " (events " + std::to_string(completed_events) + "/" + std::to_string(total_events) +
-        " (" + std::to_string(percent) + "%))" + status);
+        " (" + std::to_string(percent) + "%))" + status, true);
     last_update = std::chrono::steady_clock::now();
   }
 
@@ -1346,16 +1371,18 @@ class SimulationJobQueue {
   explicit SimulationJobQueue(std::vector<SimulationJob> jobs) : jobs_(std::move(jobs)) {}
 
   const SimulationJob* take() {
-    if (pending() == 0) return nullptr;
-    return &jobs_[next_++];
+    const auto index = next_.fetch_add(1, std::memory_order_relaxed);
+    return index < jobs_.size() ? &jobs_[index] : nullptr;
   }
-  std::size_t pending() const { return jobs_.size() - next_; }
+  std::size_t pending() const {
+    return jobs_.size() - std::min(jobs_.size(), next_.load(std::memory_order_relaxed));
+  }
   std::size_t size() const { return jobs_.size(); }
   const std::vector<SimulationJob>& jobs() const { return jobs_; }
 
  private:
   const std::vector<SimulationJob> jobs_;
-  std::size_t next_ = 0;
+  std::atomic<std::size_t> next_{0};
 };
 
 class SimulationRunner {
@@ -1416,22 +1443,25 @@ class SimulationRunner {
     auto queue = make_job_queue();
     std::vector<Result> results(queue.size());
     const std::uint64_t total_steps = queue.size();
-    std::uint64_t completed_steps = 0;
+    ProgressState progress_state;
 
     while (const auto* job = queue.take()) {
       Options configured = options;
       configured.sampled_size = job->sample_size;
-      configured.progress_done = completed_steps;
+      configured.progress_done = progress_state.completed.load(std::memory_order_relaxed);
+      configured.progress_state = &progress_state;
+      configured.progress_worker = 0;
+      configured.progress_job = job->result_index;
       configured.progress_total = total_steps;
       configured.progress_label = job->label;
-      report_progress(options, completed_steps, total_steps, job->label);
+      report_progress(configured, 0, total_steps, job->label, true);
       const bool sampling = job->policy.find("sampling-lru-") == 0;
       results[job->result_index] = sampling
           ? simulate_sampled(input, job->capacity, configured, job->policy == "sampling-lru-touch-on-put")
           : run(job->policy, job->capacity);
-      ++completed_steps;
+      progress_state.completed.fetch_add(1, std::memory_order_relaxed);
       if (job->capacity_index != 0)
-        report_progress(options, completed_steps, total_steps, job->label);
+        report_progress(configured, 0, total_steps, job->label, true);
     }
 
     std::cout << "{"
