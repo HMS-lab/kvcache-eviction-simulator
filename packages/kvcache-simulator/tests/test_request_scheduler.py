@@ -152,6 +152,48 @@ void alternate() {
   assert(&RequestScheduler::get() == &scheduler);
   assert(simulate_sampled(input,1,options).hit_tokens == 64);
 }
+void job_queue() {
+  SimulationJobQueue empty({});
+  assert(empty.size() == 0 && empty.pending() == 0);
+  assert(!empty.take() && !empty.take());
+
+  SimulationInput input;
+  input.prefix.parent = {0};
+  Options options;
+  options.scheduler = "sequential";
+  options.policy = "batch";
+  options.policies = {"lru", "sampling-lru-touch-on-get", "fifo", "sampling-lru-touch-on-put"};
+  options.capacities = {2,99,2};
+  options.sampled_sizes = {16,32};
+  SimulationRunner runner(input, options);
+  auto queue = runner.make_job_queue();
+  assert(queue.size() == 19 && queue.pending() == 19);
+  const auto* ceiling = queue.take();
+  assert(ceiling == &queue.jobs()[0]);
+  assert(ceiling->result_index == 0 && ceiling->policy == "ceiling");
+  assert(ceiling->capacity_index == 0 && ceiling->label == "ceiling");
+  const std::vector<std::string> policies{
+    "sampling-lru-touch-on-get", "sampling-lru-touch-on-get",
+    "sampling-lru-touch-on-put", "sampling-lru-touch-on-put", "lru", "fifo"};
+  for (std::size_t point = 0; point < 3; ++point) {
+    for (std::size_t policy = 0; policy < policies.size(); ++policy) {
+      const auto* job = queue.take();
+      const auto index = 1 + point * policies.size() + policy;
+      assert(job == &queue.jobs()[index] && job->result_index == index);
+      assert(job->policy == policies[policy]);
+      assert(job->capacity == options.capacities[point] && job->capacity_index == point + 1);
+      const auto size = policy < 4 ? options.sampled_sizes[policy % 2] : 0;
+      assert(job->sample_size == size);
+      assert(job->id == (policy < 4 ? job->policy + ":sample-size=" + std::to_string(size) : job->policy));
+      assert(job->label.find("policy " + std::to_string(policy + 1) + "/6)") != std::string::npos);
+      assert(queue.pending() == queue.size() - index - 1);
+    }
+  }
+  assert(queue.pending() == 0 && queue.size() == 19);
+  assert(!queue.take() && !queue.take());
+  // Taking later jobs never invalidates earlier descriptors.
+  assert(ceiling == &queue.jobs()[0] && ceiling->policy == "ceiling");
+}
 void singleton_guard(const std::string& mode) {
   if (mode == "uninitialized") { RequestScheduler::get(); return; }
   AlternateScheduler schedule;
@@ -171,6 +213,7 @@ int main(int argc, char** argv) {
   else if (mode == "legacy-regression") legacy_regression();
   else if (mode == "lifecycle") lifecycle();
   else if (mode == "alternate") alternate();
+  else if (mode == "job-queue") job_queue();
   else if (mode == "uninitialized" || mode == "duplicate" || mode == "partial"
            || mode == "consumed" || mode == "missing-cursor" || mode == "duplicate-cursor") singleton_guard(mode);
   else {
@@ -229,6 +272,9 @@ class NativeRequestSchedulerTests(unittest.TestCase):
 
     def test_alternate_strategy_and_early_returns_through_base_interface(self):
         subprocess.run([str(self.binary), 'alternate'], check=True, capture_output=True)
+
+    def test_job_queue_expansion_order_and_pending_count(self):
+        subprocess.run([str(self.binary), 'job-queue'], check=True, capture_output=True)
 
     def test_construct_once_and_reuse_across_capacities(self):
         trace = parse_trace_lines([json.dumps(dict(

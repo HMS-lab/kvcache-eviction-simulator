@@ -1329,6 +1329,35 @@ std::unique_ptr<const RequestScheduler> make_scheduler(const SimulationInput& in
   throw std::runtime_error("Select --scheduler sequential or --scheduler recorded");
 }
 
+struct SimulationJob {
+  std::size_t result_index;
+  std::string policy;
+  std::string id;
+  std::uint32_t capacity;
+  std::size_t capacity_index;  // One-based output point, or zero for the ceiling.
+  std::uint32_t sample_size;
+  std::string label;
+};
+
+// All jobs are known before execution. Only the next-job index changes.
+// The main thread currently consumes the entire queue.
+class SimulationJobQueue {
+ public:
+  explicit SimulationJobQueue(std::vector<SimulationJob> jobs) : jobs_(std::move(jobs)) {}
+
+  const SimulationJob* take() {
+    if (pending() == 0) return nullptr;
+    return &jobs_[next_++];
+  }
+  std::size_t pending() const { return jobs_.size() - next_; }
+  std::size_t size() const { return jobs_.size(); }
+  const std::vector<SimulationJob>& jobs() const { return jobs_; }
+
+ private:
+  const std::vector<SimulationJob> jobs_;
+  std::size_t next_ = 0;
+};
+
 class SimulationRunner {
  public:
   SimulationRunner(const SimulationInput& input, const Options& options)
@@ -1361,55 +1390,68 @@ class SimulationRunner {
     return {"fifo", "lru", "lru-flat-touch-on-put", "flat-lru-memcache", "hyper-clock", "optimal", "sampling-lru-touch-on-put", "sampling-lru-touch-on-get"};
   }
 
-  void print_batch_results() {
-    const std::uint64_t trie_node_count = input.prefix.parent.size();
-    const std::uint64_t policy_count = selected_policy_count(options);
-    const std::uint64_t total_steps = 1 + options.capacities.size() * policy_count;
-    std::uint64_t completed_steps = 0;
-
-    report_progress(options, completed_steps, total_steps, "ceiling");
-    const Result ceiling = run("ceiling", 0);
-    completed_steps += 1;
-
-    std::cout << "{"
-              << "\"trieNodeCount\":" << trie_node_count << ","
-              << "\"uniqueBlocks\":" << input.unique_blocks << ","
-              << "\"warmupRequests\":" << options.warmup_requests << ","
-              << "\"ceiling\":{";
-    print_named_result("ceiling", input.unique_blocks, ceiling, options.warmup_requests);
-    std::cout << "},\"points\":[";
-
-    bool first_point = true;
-    std::uint64_t capacity_index = 0;
-    for (std::uint32_t capacity : options.capacities) {
-      ++capacity_index;
-      if (!first_point) std::cout << ",";
-      first_point = false;
-      std::cout << "{\"cacheBlocks\":" << capacity;
+  SimulationJobQueue make_job_queue() const {
+    std::vector<SimulationJob> jobs;
+    jobs.push_back({0, "ceiling", "ceiling", 0, 0, options.sampled_size, "ceiling"});
+    const auto policy_count = selected_policy_count(options);
+    auto names = selected_names();
+    std::stable_partition(names.begin(), names.end(), [](const auto& p) { return p.find("sampling-lru-") == 0; });
+    for (std::size_t point = 0; point < options.capacities.size(); ++point) {
+      const auto capacity = options.capacities[point];
       std::uint64_t policy_index = 0;
-      auto names = selected_names();
-      std::stable_partition(names.begin(), names.end(), [](const auto& p) { return p.find("sampling-lru-") == 0; });
       for (const auto& policy : names) {
         const bool sampling = policy.find("sampling-lru-") == 0;
         const auto sizes = sampling ? options.sampled_sizes : std::vector<std::uint32_t>{0};
         for (auto size : sizes) {
           const auto id = sampling && sizes.size() > 1 ? policy + ":sample-size=" + std::to_string(size) : policy;
-          Options configured = options;
-          configured.sampled_size = size;
-          const std::string label = id + " (cache capacity " + std::to_string(capacity_index) + "/" + std::to_string(options.capacities.size()) + ", " + std::to_string(capacity) + " blocks; policy " + std::to_string(++policy_index) + "/" + std::to_string(policy_count) + ")";
-          configured.progress_done = completed_steps;
-          configured.progress_total = total_steps;
-          configured.progress_label = label;
-          report_progress(options, completed_steps, total_steps, label);
-          Result result = sampling ? simulate_sampled(input, capacity, configured, policy == "sampling-lru-touch-on-put") : run(policy, capacity);
-          ++completed_steps;
-          report_progress(options, completed_steps, total_steps, label);
-          std::cout << ",\"" << id << "\":{";
-          print_named_result(policy.c_str(), capacity, result, options.warmup_requests);
-          std::cout << "}";
+          const std::string label = id + " (cache capacity " + std::to_string(point + 1) + "/" + std::to_string(options.capacities.size()) + ", " + std::to_string(capacity) + " blocks; policy " + std::to_string(++policy_index) + "/" + std::to_string(policy_count) + ")";
+          jobs.push_back({jobs.size(), policy, id, capacity, point + 1, size, label});
         }
       }
+    }
+    return SimulationJobQueue(std::move(jobs));
+  }
 
+  void print_batch_results() {
+    auto queue = make_job_queue();
+    std::vector<Result> results(queue.size());
+    const std::uint64_t total_steps = queue.size();
+    std::uint64_t completed_steps = 0;
+
+    while (const auto* job = queue.take()) {
+      Options configured = options;
+      configured.sampled_size = job->sample_size;
+      configured.progress_done = completed_steps;
+      configured.progress_total = total_steps;
+      configured.progress_label = job->label;
+      report_progress(options, completed_steps, total_steps, job->label);
+      const bool sampling = job->policy.find("sampling-lru-") == 0;
+      results[job->result_index] = sampling
+          ? simulate_sampled(input, job->capacity, configured, job->policy == "sampling-lru-touch-on-put")
+          : run(job->policy, job->capacity);
+      ++completed_steps;
+      if (job->capacity_index != 0)
+        report_progress(options, completed_steps, total_steps, job->label);
+    }
+
+    std::cout << "{"
+              << "\"trieNodeCount\":" << input.prefix.parent.size() << ","
+              << "\"uniqueBlocks\":" << input.unique_blocks << ","
+              << "\"warmupRequests\":" << options.warmup_requests << ","
+              << "\"ceiling\":{";
+    print_named_result("ceiling", input.unique_blocks, results[0], options.warmup_requests);
+    std::cout << "},\"points\":[";
+
+    std::size_t job_index = 1;
+    for (std::size_t point = 0; point < options.capacities.size(); ++point) {
+      if (point != 0) std::cout << ",";
+      std::cout << "{\"cacheBlocks\":" << options.capacities[point];
+      while (job_index < queue.size() && queue.jobs()[job_index].capacity_index == point + 1) {
+        const auto& job = queue.jobs()[job_index++];
+        std::cout << ",\"" << job.id << "\":{";
+        print_named_result(job.policy.c_str(), job.capacity, results[job.result_index], options.warmup_requests);
+        std::cout << "}";
+      }
       std::cout << "}";
     }
     report_progress(options, total_steps, total_steps, "simulation complete");
