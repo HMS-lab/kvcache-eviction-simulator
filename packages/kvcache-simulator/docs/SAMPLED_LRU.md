@@ -224,13 +224,46 @@ Ties in access time use access sequence, oldest first. Blocks whose age equals
 the positive threshold do not qualify. Later writes use the extra free slots
 without further sampling.
 
-The limit does not change the fallback. If no sampled entry qualifies, the policy uses this fallback:
+If no sampled entry qualifies, the policy uses this fallback:
 
-1. Scan slots from index zero.
-2. Stop after finding and evicting one eligible entry.
-3. If a complete scan finds no eligible entry, halve a local copy of the threshold.
-4. Restart the scan from index zero.
-5. Repeat until one entry qualifies.
+1. Scan all slots once. Collect resident slot indices.
+2. Build a min-heap from these indices. The oldest entry is at the top.
+3. Check the oldest entry against the configured threshold.
+4. If it does not qualify, halve a local copy of the threshold. Repeat the check without another scan.
+5. Evict eligible entries from the heap, oldest first, up to `--sampled-lru-max-evictions`.
+
+Without an eviction limit, the fallback evicts all entries eligible at the selected threshold.
+The fallback stops before an entry that does not qualify. Equal timestamps use access sequence, oldest first.
+The successful-sample path keeps its existing behavior.
+
+For `N` resident entries and `K` victims, the fallback uses `O(N + K log N)` work and `O(N)` temporary storage.
+Threshold halving adds at most 64 checks of the oldest entry for a 64-bit threshold.
+It does not repeat the full scan.
+
+C++ tests: [test_sampled_lru_fallback.py](../tests/test_sampled_lru_fallback.py),
+`NativeHeapFallbackTests.test_oldest_first_limit_and_local_halving`,
+`test_configured_threshold_and_strict_age_boundary`, and `test_zero_age_ties_and_no_repeated_full_scans`.
+
+For example, use a threshold of 10 microseconds, an eviction limit of 2, and the following full cache:
+
+```text
+slot:                  0      1      2      3      4
+before:              [A@9]  [B@8]  [C@3]  [D@2]  [E@1]
+age at now=10:          1      2      7      8      9
+sample:                ^
+                       A does not qualify
+
+one scan -> min-heap: E, D, C, B, A (oldest first)
+threshold 10: E's age 9 does not qualify
+threshold  5: E qualifies; evict E, then D; stop at limit 2
+insert F@10:         [A@9]  [B@8]  [C@3] [F@10]   [--]
+```
+
+The final insertion reuses slot 3, the last freed slot.
+Without a limit, the fallback also evicts C. B and A remain because their ages do not exceed 5.
+The configured threshold remains 10 for the next eviction.
+Test: `NativeHeapFallbackTests.test_oldest_first_limit_and_local_halving` in
+[test_sampled_lru_fallback.py](../tests/test_sampled_lru_fallback.py).
 
 Integer halving reaches zero. At zero, entries accessed at the current time
 also qualify. Each new eviction operation starts with the configured threshold.
@@ -333,16 +366,16 @@ linear scan:         ^
 after D:            [D@20]   [B@15]   [C@19]
 ```
 
-This scan succeeds at the configured threshold. There is no threshold halving
-and no second sample. The fallback stops once this insertion has space; the
-sampling phase is the phase that evicts every eligible member of its sample.
+The fallback scans all three slots and builds the heap. A is the only eligible entry at the configured threshold.
+The fallback therefore evicts A. It does not halve the threshold or take another sample.
+The diagram marks the victim. It does not show every slot that the scan inspects.
 
 Test: [test_sampled_lru_examples.py —
 NativeDocumentedExamplesTests.test_sample_miss_falls_back_to_first_eligible_slot](../tests/test_sampled_lru_examples.py#L173).
 
 ### 3. Halving is local, and zero permits eviction of same-time entries
 
-Capacity and sample size are both 2. A and B were last accessed at time 8;
+Capacity and sample size are both 2. The eviction limit is 1. A and B were last accessed at time 8;
 C, D, and E are written one after another at time 10.
 
 ```text
@@ -350,21 +383,21 @@ initial slots:       [A@8] [B@8]       both ages = 2
 
 write C@10:
   sample both at threshold 10 -> no victims
-  scan with threshold 10     -> none
-  scan with threshold  5     -> none
-  scan with threshold  2.5   -> none
-  scan with threshold  1.25  -> evict A from slot 0
+  heap check at threshold 10     -> none
+  heap check at threshold  5     -> none
+  heap check at threshold  2.5   -> none
+  heap check at threshold  1.25  -> evict A from slot 0
   slots:             [C@10] [B@8]
 
 write D@10:
   START AGAIN at threshold 10; sample both -> no victims
-  scans: 10 -> 5 -> 2.5 -> 1.25
+  heap checks: 10 -> 5 -> 2.5 -> 1.25
   slot 0: C's age 0 fails; slot 1: B's age 2 qualifies
   slots:             [C@10] [D@10]
 
 write E@10:
   START AGAIN at threshold 10; both ages = 0
-  scans: 10 -> 5 -> 2.5 -> 1.25 -> ... -> 0.000001 -> 0
+  heap checks: 10 -> 5 -> 2.5 -> 1.25 -> ... -> 0.000001 -> 0
   at ZERO: every resident entry is eligible, including age 0
   evict C from slot 0
   slots:             [E@10] [D@10]
@@ -373,7 +406,7 @@ configured threshold after all three writes: still 10 seconds
 ```
 
 Halving operates on integer microseconds, rounding down. Zero is a special rule:
-it permits eviction even when `last_access_time == now`. Only the local scan
+it permits eviction even when `last_access_time == now`. Only the local eviction
 threshold changes; the next eviction starts at the configured value.
 
 Test: [test_sampled_lru_examples.py —

@@ -101,13 +101,17 @@ class SampledCache:
             self.discard(index)
         if victims:
             return
+        candidates = [(slot.timestamp, slot.sequence, index)
+                      for index, slot in enumerate(self.slots) if slot is not None]
+        heapq.heapify(candidates)
         threshold = self.threshold
-        while True:
-            for index, slot in enumerate(self.slots):
-                if slot is not None and eligible(slot, threshold):
-                    self.discard(index)
-                    return
+        while not eligible(self.slots[candidates[0][2]], threshold):
             threshold //= 2
+        evicted = 0
+        while (candidates and (self.max_evictions is None or evicted < self.max_evictions)
+               and eligible(self.slots[candidates[0][2]], threshold)):
+            self.discard(heapq.heappop(candidates)[2])
+            evicted += 1
 
     def write(self, node: int, now: int) -> None:
         if self.capacity <= 0:

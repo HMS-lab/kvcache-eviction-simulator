@@ -178,6 +178,8 @@ See [timing and tie rules](docs/SAMPLED_LRU.md#clock-and-cache-access) for detai
 
 Sequential replay keeps every Sampling LRU timestamp at zero.
 A positive age threshold therefore reaches the threshold-halving fallback during eviction.
+The fallback scans the cache once and builds a min-heap. Threshold checks then use the oldest entry without another scan.
+It evicts eligible entries, oldest first, up to `--sampled-lru-max-evictions`. Without a limit, it evicts all eligible entries.
 A threshold of zero makes all sampled resident blocks eligible immediately.
 Use recorded-time replay when you need a threshold measured in seconds.
 

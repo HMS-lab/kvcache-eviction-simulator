@@ -1097,10 +1097,27 @@ struct SampledCache {
       }
     }
     if (!free.empty()) return;
+    // Build once. Threshold halving checks only the oldest resident entry.
+    std::vector<std::size_t> candidates;
+    candidates.reserve(slots.size());
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+      if (slots[i].node != 0) candidates.push_back(i);
+    }
+    const auto newer = [&](std::size_t a, std::size_t b) {
+      return std::tie(slots[a].timestamp, slots[a].sequence) >
+             std::tie(slots[b].timestamp, slots[b].sequence);
+    };
+    std::make_heap(candidates.begin(), candidates.end(), newer);
+    assert(!candidates.empty());
     auto age = threshold;
-    for (;;) {
-      for (std::size_t i = 0; i < slots.size(); ++i) if (eligible(slots[i], now, age)) { discard(i); return; }
-      age /= 2;
+    while (!eligible(slots[candidates.front()], now, age)) age /= 2;
+    while (!candidates.empty() && evicted < max_evictions &&
+           eligible(slots[candidates.front()], now, age)) {
+      std::pop_heap(candidates.begin(), candidates.end(), newer);
+      const auto index = candidates.back();
+      candidates.pop_back();
+      discard(index);
+      ++evicted;
     }
   }
   void write(std::uint32_t node, std::uint64_t now) {

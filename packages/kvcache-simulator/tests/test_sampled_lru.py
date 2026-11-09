@@ -99,15 +99,15 @@ class CacheTests(unittest.TestCase):
         c.lookup(2, 20)
         with patch.object(c.rng, 'sample', return_value=[2]):
             c.write(3, 20)
-        self.assertEqual(set(c.entries), {1, 2, 3})
+        self.assertEqual(set(c.entries), {2, 3})
 
     def test_halving_is_local_and_zero_includes_now(self):
-        c = SampledCache(2, 10, 2, 0)
+        c = SampledCache(2, 10, 2, 0, max_evictions=1)
         c.write(1, 0); c.write(2, 0)
         c.write(3, 0)
         self.assertEqual(c.threshold, 10)
         # At age ten the strict configured threshold excludes both existing entries.
-        # Fallback halves it and removes only the first slot, not the whole sample.
+        # Fallback halves it and removes only the oldest entry because the limit is 1.
         c.write(4, 10)
         self.assertEqual(len(c.entries), 2)
         self.assertEqual(c.threshold, 10)
@@ -339,7 +339,7 @@ int main() {
   c.write(6, 20); c.write(7, 20);
   assert(c.size() == 4 && c.free.empty());
   c.write(8, 20);
-  assert(c.threshold == 10 && c.size() == 4);
+  assert(c.threshold == 10 && c.size() == 1);
   o.sampled_threshold = 0;
   SampledCache z(2, o, 16); z.write(1, 0); z.write(2, 0); z.write(3, 0);
   assert(z.size() == 1 && z.contains(3));
