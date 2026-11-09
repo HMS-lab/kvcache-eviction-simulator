@@ -197,14 +197,10 @@ Options parse_args(int argc, char** argv) {
 std::mutex progress_output_mutex;
 
 void report_progress(const Options& options, std::uint64_t done, std::uint64_t total,
-                     const std::string& label, bool best_effort = false) {
+                     const std::string& label) {
   if (!options.progress) return;
-  std::unique_lock<std::mutex> lock(progress_output_mutex, std::defer_lock);
-  if (best_effort) {
-    if (!lock.try_lock()) return;
-  } else {
-    lock.lock();
-  }
+  std::unique_lock<std::mutex> lock(progress_output_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) return;
   // Read after locking so concurrent messages cannot publish an older count.
   if (options.progress_state) done = options.progress_state->completed.load(std::memory_order_relaxed);
   if (options.progress_worker >= 0) {
@@ -1103,7 +1099,7 @@ struct SampledProgress {
     const auto percent = total_events ? 100 * completed_events / total_events : 100;
     report_progress(options, options.progress_done, options.progress_total,
         label + " (events " + std::to_string(completed_events) + "/" + std::to_string(total_events) +
-        " (" + std::to_string(percent) + "%))" + status, true);
+        " (" + std::to_string(percent) + "%))" + status);
     last_update = std::chrono::steady_clock::now();
   }
 
@@ -1454,14 +1450,14 @@ class SimulationRunner {
       configured.progress_job = job->result_index;
       configured.progress_total = total_steps;
       configured.progress_label = job->label;
-      report_progress(configured, 0, total_steps, job->label, true);
+      report_progress(configured, 0, total_steps, job->label);
       const bool sampling = job->policy.find("sampling-lru-") == 0;
       results[job->result_index] = sampling
           ? simulate_sampled(input, job->capacity, configured, job->policy == "sampling-lru-touch-on-put")
           : run(job->policy, job->capacity);
       progress_state.completed.fetch_add(1, std::memory_order_relaxed);
       if (job->capacity_index != 0)
-        report_progress(configured, 0, total_steps, job->label, true);
+        report_progress(configured, 0, total_steps, job->label);
     }
 
     std::cout << "{"

@@ -200,7 +200,7 @@ void concurrent_reporting() {
   Options options; options.progress = true;
   {
     std::lock_guard<std::mutex> lock(progress_output_mutex);
-    std::thread attempt([&] { report_progress(options, 0, 1, "dropped", true); });
+    std::thread attempt([&] { report_progress(options, 0, 1, "dropped"); });
     attempt.join(); // Best-effort reporting must not wait for this lock.
     assert(output.str().empty());
   }
@@ -221,7 +221,7 @@ void concurrent_reporting() {
         seen[job->result_index].fetch_add(1);
         state.completed.fetch_add(1, std::memory_order_relaxed);
         local.progress_job = job->result_index;
-        report_progress(local, 0, queue.size(), job->label, true);
+        report_progress(local, 0, queue.size(), job->label);
       }
     });
   }
