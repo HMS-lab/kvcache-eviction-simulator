@@ -2,6 +2,7 @@
 #include <cassert>
 #include <optional>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -40,6 +41,8 @@ struct Options {
   std::vector<std::uint32_t> capacities;
   std::vector<std::string> policies;
   bool progress = false;
+  std::uint64_t progress_done = 0, progress_total = 1;
+  std::string progress_label;
   std::string arrivals_path, completions_path, order_path;
   std::uint64_t sampled_threshold = 10000000, sampled_seed = 0;
   std::vector<std::uint32_t> sampled_sizes{16};
@@ -1050,6 +1053,34 @@ struct SampledSlot {
   std::uint32_t node = 0;
   std::uint64_t timestamp = 0, sequence = 0;
 };
+struct SampledCounters {
+  std::uint64_t attempts = 0, fallbacks = 0, inspected = 0;
+  std::uint64_t sampled_evictions = 0, fallback_evictions = 0;
+};
+
+struct SampledProgress {
+  const Options& options;
+  const SampledCounters& counters;
+  std::uint64_t total_events, completed_events = 0, work = 0;
+  std::string label;
+  std::chrono::steady_clock::time_point last_update = std::chrono::steady_clock::now();
+
+  void report(const std::string& status = "") {
+    if (!options.progress) return;
+    const auto percent = total_events ? 100 * completed_events / total_events : 100;
+    report_progress(options, options.progress_done, options.progress_total,
+        label + " (events " + std::to_string(completed_events) + "/" + std::to_string(total_events) +
+        " (" + std::to_string(percent) + "%))" + status);
+    last_update = std::chrono::steady_clock::now();
+  }
+
+  void tick() {
+    // Check wall time every 4096 operations, including work inside long events.
+    if ((++work & 4095) != 0) return;
+    if (std::chrono::steady_clock::now() - last_update >= std::chrono::seconds(1)) report();
+  }
+};
+
 struct SampledCache {
   std::uint32_t capacity, sample_size, max_evictions;
   std::uint64_t threshold, sequence = 0;
@@ -1059,6 +1090,8 @@ struct SampledCache {
   std::vector<std::size_t> free;
   static constexpr std::uint32_t absent = 0xffffffffU;
   std::vector<std::uint32_t> node_to_slot;
+  SampledCounters counters;
+  SampledProgress* progress = nullptr;
   SampledCache(std::uint32_t cap, const Options& o, std::size_t node_count, bool touch_on_put = true)
       : capacity(cap), sample_size(o.sampled_size), max_evictions(o.sampled_max_evictions), threshold(o.sampled_threshold), touch_on_put(touch_on_put), rng(o.sampled_seed), node_to_slot(node_count, absent) {}
   std::size_t size() const { return slots.size() - free.size(); }
@@ -1076,6 +1109,7 @@ struct SampledCache {
     return slot.node != 0 && (age == 0 || now - slot.timestamp > age);
   }
   void evict(std::uint64_t now) {
+    ++counters.attempts;
     std::vector<SampledSlot> sample;
     const auto count = std::min<std::size_t>(sample_size, slots.size());
     sample.reserve(count);
@@ -1085,23 +1119,29 @@ struct SampledCache {
     while (sample.size() < count) {
       const auto index = draw(rng);
       if (selected.insert(index).second) sample.push_back(slots[index]);
+      if (progress) progress->tick();
     }
     std::sort(sample.begin(), sample.end(), [](const auto& a, const auto& b) {
       return std::tie(a.timestamp, a.sequence) < std::tie(b.timestamp, b.sequence);
     });
     std::uint32_t evicted = 0;
     for (const auto& slot : sample) {
+      if (progress) progress->tick();
       if (eligible(slot, now, threshold)) {
         discard(node_to_slot[slot.node]);
+        ++counters.sampled_evictions;
         if (++evicted == max_evictions) break;
       }
     }
     if (!free.empty()) return;
+    ++counters.fallbacks;
     // Build once. Threshold halving checks only the oldest resident entry.
     std::vector<std::size_t> candidates;
     candidates.reserve(slots.size());
     for (std::size_t i = 0; i < slots.size(); ++i) {
       if (slots[i].node != 0) candidates.push_back(i);
+      ++counters.inspected;
+      if (progress) progress->tick();
     }
     const auto newer = [&](std::size_t a, std::size_t b) {
       return std::tie(slots[a].timestamp, slots[a].sequence) >
@@ -1117,7 +1157,9 @@ struct SampledCache {
       const auto index = candidates.back();
       candidates.pop_back();
       discard(index);
+      ++counters.fallback_evictions;
       ++evicted;
+      if (progress) progress->tick();
     }
   }
   void write(std::uint32_t node, std::uint64_t now) {
@@ -1136,12 +1178,24 @@ struct SampledCache {
 
 Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, const Options& options, bool touch_on_put = true) {
   auto& scheduler = RequestScheduler::get();
+  SampledCache cache(capacity, options, capacity ? input.prefix.parent.size() : 0, touch_on_put);
+  auto label = options.progress_label.empty()
+      ? std::string(touch_on_put ? "sampling-lru-touch-on-put" : "sampling-lru-touch-on-get") +
+        ":sample-size=" + std::to_string(options.sampled_size) + " (" + std::to_string(capacity) + " blocks)"
+      : options.progress_label;
+  if (label.find(":sample-size=") == std::string::npos)
+    label += " | sample size " + std::to_string(options.sampled_size);
+  SampledProgress progress{options, cache.counters, 2ULL * input.request_ends.size(), 0, 0, label};
   if (!capacity) {
+    progress.report(" | skipped: zero capacity");
     scheduler.discard_remaining();
     scheduler.reset();
     return no_cache_result(input, options);
   }
-  SampledCache cache(capacity, options, input.prefix.parent.size(), touch_on_put);
+  if (options.progress) {
+    cache.progress = &progress;
+    progress.report();
+  }
   Result result;
   result.measurement_start_request = options.warmup_requests;
   bool full = false;
@@ -1153,9 +1207,11 @@ Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, co
       for (auto i = start; i < end; ++i) {
         cache.write(input.prefix.node_for_event[i], event->timestamp);
         if (cache.size() == capacity) full = true;
+        if (cache.progress) progress.tick();
       }
     } else {
       if (request >= options.warmup_requests && !full) {
+        progress.report(" | stopped: cache underfilled at measurement boundary");
         scheduler.discard_remaining();
         scheduler.reset();
         return underfilled_result(input, options);
@@ -1167,9 +1223,13 @@ Result simulate_sampled(const SimulationInput& input, std::uint32_t capacity, co
           alive = cache.lookup(input.prefix.node_for_event[i], event->timestamp);
           if (alive && request >= options.warmup_requests) result.hit_tokens += input.tokens[i];
         }
+        if (cache.progress) progress.tick();
       }
     }
+    ++progress.completed_events;
+    if (cache.progress) progress.tick();
   }
+  progress.report();
   scheduler.reset();
   if (!full || !result.total_tokens) return underfilled_result(input, options);
   return result;
@@ -1350,6 +1410,9 @@ class SimulationRunner {
           Options configured = options;
           configured.sampled_size = size;
           const std::string label = id + " (cache capacity " + std::to_string(capacity_index) + "/" + std::to_string(options.capacities.size()) + ", " + std::to_string(capacity) + " blocks; policy " + std::to_string(++policy_index) + "/" + std::to_string(policy_count) + ")";
+          configured.progress_done = completed_steps;
+          configured.progress_total = total_steps;
+          configured.progress_label = label;
           report_progress(options, completed_steps, total_steps, label);
           Result result = sampling ? simulate_sampled(input, capacity, configured, policy == "sampling-lru-touch-on-put") : run(policy, capacity);
           ++completed_steps;

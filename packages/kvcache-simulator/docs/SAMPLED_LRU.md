@@ -94,6 +94,27 @@ With an eviction limit of 2, they leave 5, 4, 4, and 4 entries.
 These values are checked by
 [`SampleSizeTests.test_native_eviction_counts`](../tests/test_sample_sizes.py).
 
+## Progress display
+
+Each Sampling LRU run reports progress during execution. The label identifies the policy, sample size, and cache capacity.
+The label ends with `(events completed/total (X%))`, the percentage of scheduler events completed within that run.
+Each request has two events: arrival and completion. An event counts as complete after all its cache operations finish.
+
+Updates occur about once per second during active processing, including long requests and fallback scans.
+The simulator checks wall time every 4096 operations to limit logging overhead.
+It also reports the start and end of each run. Short runs can finish before the first periodic update.
+
+The event percentage belongs to the current run. The bar percentage tracks completed runs across the whole simulation.
+An underfilled cache reports its percentage at the stopping point. It does not count skipped events as processed.
+A zero-capacity run reports that it skips cache simulation.
+
+The CLI displays progress on interactive stderr. Use `--no-progress` to disable it.
+The progress display does not change JSON results or cache behavior.
+
+C++ tests: [test_sampled_lru_progress.py](../tests/test_sampled_lru_progress.py),
+`NativeSampledProgressTests.test_event_counts_run_identity_and_unchanged_results`,
+`test_early_exit_reports_actual_events`, and `test_throttle_counters_and_updates_inside_long_fallback`.
+
 ## Trace timing
 
 Timing fields contain numeric seconds. The simulator converts these values to
