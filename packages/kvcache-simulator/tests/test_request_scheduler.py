@@ -175,7 +175,8 @@ void job_queue() {
   const std::vector<std::string> policies{
     "sampling-lru-touch-on-get", "sampling-lru-touch-on-get",
     "sampling-lru-touch-on-put", "sampling-lru-touch-on-put", "lru", "fifo"};
-  for (std::size_t point = 0; point < 3; ++point) {
+  std::size_t taken = 1;
+  for (std::size_t point : {1,0,2}) {
     for (std::size_t policy = 0; policy < policies.size(); ++policy) {
       const auto* job = queue.take();
       const auto index = 1 + point * policies.size() + policy;
@@ -186,7 +187,7 @@ void job_queue() {
       assert(job->sample_size == size);
       assert(job->id == (policy < 4 ? job->policy + ":sample-size=" + std::to_string(size) : job->policy));
       assert(job->label.find("policy " + std::to_string(policy + 1) + "/6)") != std::string::npos);
-      assert(queue.pending() == queue.size() - index - 1);
+      assert(queue.pending() == queue.size() - ++taken);
     }
   }
   assert(queue.pending() == 0 && queue.size() == 19);

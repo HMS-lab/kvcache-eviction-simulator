@@ -67,7 +67,7 @@ class NativeTraceHandoffTests(unittest.TestCase):
                        if " (cache capacity " in update[2] and " (events " not in update[2]]
         expected_labels = [
             f"{policy} (cache capacity {capacity_index}/2, {capacity} blocks; policy {policy_index}/2)"
-            for capacity_index, capacity in enumerate([4, 8], 1)
+            for capacity_index, capacity in [(2, 8), (1, 4)]
             for policy_index, policy in enumerate(["sampling-lru-touch-on-put", "hyper-clock"], 1)
         ]
         self.assertEqual([label for _, _, label in evaluations],

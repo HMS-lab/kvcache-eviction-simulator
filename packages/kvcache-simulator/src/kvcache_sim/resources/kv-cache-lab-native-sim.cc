@@ -1364,11 +1364,22 @@ struct SimulationJob {
 // The main thread currently consumes the entire queue.
 class SimulationJobQueue {
  public:
-  explicit SimulationJobQueue(std::vector<SimulationJob> jobs) : jobs_(std::move(jobs)) {}
+  explicit SimulationJobQueue(std::vector<SimulationJob> jobs)
+      : jobs_(std::move(jobs)), order_(jobs_.size()) {
+    for (std::size_t n = 0; n < order_.size(); ++n) order_[n] = n;
+    // Keep descriptors in report order. Dispatch the ceiling first, then larger
+    // capacities, preserving policy/sample order and ties between capacities.
+    std::stable_sort(order_.begin(), order_.end(), [&](auto a, auto b) {
+      const bool ceiling_a = jobs_[a].policy == "ceiling";
+      const bool ceiling_b = jobs_[b].policy == "ceiling";
+      if (ceiling_a != ceiling_b) return ceiling_a;
+      return jobs_[a].capacity > jobs_[b].capacity;
+    });
+  }
 
   const SimulationJob* take() {
     const auto index = next_.fetch_add(1, std::memory_order_relaxed);
-    return index < jobs_.size() ? &jobs_[index] : nullptr;
+    return index < order_.size() ? &jobs_[order_[index]] : nullptr;
   }
   std::size_t pending() const {
     return jobs_.size() - std::min(jobs_.size(), next_.load(std::memory_order_relaxed));
@@ -1378,6 +1389,7 @@ class SimulationJobQueue {
 
  private:
   const std::vector<SimulationJob> jobs_;
+  std::vector<std::size_t> order_;
   std::atomic<std::size_t> next_{0};
 };
 

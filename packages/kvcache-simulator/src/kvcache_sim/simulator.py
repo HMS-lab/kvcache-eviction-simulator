@@ -50,6 +50,7 @@ def _worker_simulate(task: tuple[str, int, int, dict[str, Any]]) -> tuple[tuple[
 def _simulate_tasks(plan: ExecutionPlan, tasks: list[tuple[str, int]], jobs: int, *, hyper_clock_max_score: int = 3, **sampled) -> dict[tuple[str, int], PolicyResult]:
     if not tasks:
         return {}
+    tasks = sorted(tasks, key=lambda task: task[1], reverse=True)
     if jobs <= 1 or "fork" not in mp.get_all_start_methods():
         return {task: simulate_policy(plan, task[0], task[1], hyper_clock_max_score=hyper_clock_max_score, **sampled) for task in tasks}
 
