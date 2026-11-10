@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#087f76">
+  <title>Prefix Trace Explorer</title>
+  <link rel="stylesheet" href="/src/style.css">
+</head>
+<body>
+  <header class="header">
+    <div class="brand"><span class="brand-icon" aria-hidden="true">⋮</span><div><h1>Prefix Trace Explorer</h1><p>Inference workload, one prefix at a time</p></div><span class="tag">LOCAL</span></div>
+    <div class="header-actions"><span id="filename" class="muted">Your data stays in this browser</span><button id="demo">Try example</button><button class="primary" id="open">↗ Open trace</button><input hidden id="file" type="file" accept=".jsonl,.ndjson,application/x-ndjson,application/json"></div>
+  </header>
+
+  <div id="notice" class="notice" role="status" hidden></div>
+  <div id="loading" class="loading" hidden><div><span class="spinner"></span><strong id="progress" role="status" aria-live="polite">Trace 0/…</strong><span id="loading-detail" class="muted"></span></div><button id="cancel">Cancel</button></div>
+
+  <main>
+    <section class="filters" aria-label="Workload filters">
+      <label>First session<select id="session" disabled><option>Open a trace file to begin</option></select></label>
+      <label>Concurrent conversations<input id="concurrency" type="number" min="1" step="1" value="1" disabled></label>
+      <label>Model<select id="model" disabled><option value="*">All models</option></select></label>
+      <label>Agent<select id="agent" disabled><option value="*">All agents</option></select></label>
+      <div class="mode" role="group" aria-label="Time selection"><button id="cumulative" class="active" aria-pressed="true">Cumulative</button><button id="window" aria-pressed="false">Window</button></div>
+      <label id="window-label" hidden>Window (seconds)<input id="window-size" type="number" value="60" min="0.001" step="1"></label>
+    </section>
+
+    <section class="stats" aria-label="Workload metrics">
+      <article><span>Processed requests</span><strong id="stat-requests">—</strong><small id="stat-scope">Selected session · all models</small></article>
+      <article><span>Unique prefix blocks</span><strong id="stat-blocks">—</strong><small id="block-size">64 token slots per block</small></article>
+      <article><span>Prefix footprint <span title="Unique input prefix blocks × block size. Includes partial-block allocation. No eviction or cache simulation.">ⓘ</span></span><strong id="stat-footprint">—</strong><small>Token slots · counted once per session and model</small></article>
+      <article><span>Total input volume</span><strong id="stat-input">—</strong><small>Tokens · includes repeated prefixes</small></article>
+    </section>
+
+    <div class="workspace">
+      <section class="tree-panel panel">
+        <div class="panel-heading"><h2>Radix prefix tree</h2><div class="tree-controls"><span class="muted">Color: request count</span><label class="inline"><input id="log" type="checkbox" checked> Log</label><label class="inline">Layout<select id="layout"><option value="compact">Compact</option><option value="tokens">Token depth</option></select></label><label class="inline">Levels<select id="levels"><option>3</option><option selected>5</option><option>8</option><option>12</option><option value="100000">All</option></select></label><button id="fit">Fit</button><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-in" aria-label="Zoom in">+</button></div></div>
+        <div class="tree-wrap" id="tree-wrap"><canvas id="tree" tabindex="0" aria-label="Vertical radix tree. Drag to pan, scroll to zoom. Select a segment by clicking it, or use the segment list below."></canvas><div id="empty" class="empty"><div class="empty-glyph">⌘</div><h2>Follow the shape of your workload</h2><p>Open a JSONL trace to explore shared input prefixes,<br>agent activity, and how the footprint grows over time.</p><button id="empty-open" class="primary">Open trace file</button><p class="muted">Processed locally · no upload · no cache simulation</p></div><button id="unfocus" class="back" hidden>← Full tree</button></div>
+        <div class="tree-footer"><span id="tree-info">Root at top · prefixes grow downward</span><span class="legend">Requests <span class="gradient"></span> 1 <span id="heat-max">—</span></span></div>
+        <details class="segment-list"><summary>Browse visible segments</summary><div id="segments"></div></details>
+      </section>
+
+      <aside class="inspector panel">
+        <h2>Selected prefix</h2><p id="selection-subtitle" class="muted">Click a segment to explore its accesses</p>
+        <div id="selection" hidden>
+          <div class="selection-stats"><div><strong id="sel-blocks"></strong><small>blocks</small></div><div><strong id="sel-slots"></strong><small>token slots</small></div><div><strong id="sel-count"></strong><small>requests</small></div></div>
+          <div class="detail-row"><span>Requests ending here</span><strong id="sel-ends"></strong></div>
+          <h3>Agent breakdown</h3><div id="agent-bars"></div>
+          <h3>Accesses over time</h3><canvas id="access-chart" class="mini-chart" aria-label="Selected prefix access histogram"></canvas>
+          <div class="action-row"><button id="focus" class="primary">Focus subtree</button><button id="inspect">Inspect blocks</button></div>
+          <div id="block-panel" hidden><h3>Individual blocks</h3><p class="muted">Input hashes only; prompt text is unavailable.</p><div id="block-table"></div><div class="action-row"><button id="blocks-prev">← Previous</button><span id="block-page" class="muted"></span><button id="blocks-next">Next →</button></div></div>
+          <h3>Child prefixes</h3><p class="muted">Choose any branch to explore it, including branches outside the current view.</p><div id="child-prefixes" class="request-list"></div>
+          <h3>Matching requests</h3><div id="request-list" class="request-list"></div>
+        </div>
+        <div class="footprint-section"><h3>Cumulative prefix footprint</h3><canvas id="footprint-chart" class="mini-chart" aria-label="Cumulative prefix footprint in token slots over session time"></canvas><div class="chart-labels"><span>0s</span><span>Token slots</span><span id="chart-end">—</span></div><p class="muted">Unique recorded inputs, counted separately for each session and model. Partial blocks occupy a full block.</p><div id="model-breakdown"></div></div>
+      </aside>
+    </div>
+
+    <section class="timeline panel">
+      <div class="replay-status"><strong id="active-requests">0 active requests</strong><span id="active-sessions">0 active conversations</span></div>
+      <div class="panel-heading"><h2>Request timeline</h2><div class="playback"><button id="play" class="primary" aria-label="Play timeline" disabled>▶ Play</button><button id="previous" aria-label="Previous request" disabled>│‹</button><button id="next" aria-label="Next request" disabled>›│</button><label class="inline">Speed<select id="speed"><option value="1">1×</option><option value="10">10×</option><option value="100" selected>100×</option><option value="1000">1000×</option></select></label><output id="clock">00:00 / 00:00</output><span id="request-detail" class="muted"></span><button id="clear-agent-highlight" hidden>Clear agent highlight</button></div></div>
+      <input id="scrub" aria-label="Timeline playhead in seconds" type="range" min="0" max="1" value="0" step="0.001" disabled>
+      <div id="lanes" class="lanes"><div id="timeline-agents" aria-label="Highlight an agent’s prefix blocks"></div><canvas id="timeline" aria-label="Request durations by session. Expand a session to inspect agents. Click a request to highlight its prefix."></canvas></div>
+      <div class="timeline-footer"><span>Drag to scrub · expand a session · click an agent to highlight its blocks · click a request to highlight its prefix</span><span>Dataset time is post-filter and reshifted</span></div>
+    </section>
+  </main>
+  <footer class="page-footer">Prefix Trace Explorer <span>Session-local hashes · separate model trees · no trace data leaves your browser</span></footer>
+  <script type="module" src="/src/app.js"></script>
+</body>
+</html>

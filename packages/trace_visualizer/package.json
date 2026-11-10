@@ -1,0 +1,13 @@
+{
+  "name": "prefix-trace-explorer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs",
+    "test": "node --test tests/*.test.js",
+    "check": "node --check src/app.js && node --check src/core.js && node --check src/worker.js && node --check src/tree.js && node --check src/demo.js && node --check server.mjs"
+  },
+  "engines": { "node": ">=20" }
+}
